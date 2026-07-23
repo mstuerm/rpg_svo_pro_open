@@ -1,6 +1,8 @@
 #include "svo/ceres_backend_publisher.hpp"
 
 #include <geometry_msgs/PoseWithCovarianceStamped.h>
+#include <geometry_msgs/Vector3Stamped.h>
+#include <nav_msgs/Odometry.h>
 #include <visualization_msgs/Marker.h>
 
 #include <vikit/output_helper.h>
@@ -36,6 +38,11 @@ CeresBackendPublisher::CeresBackendPublisher(
       "backend_pose_imu", 10);
   pub_imu_pose_viz_ =
       pnh_.advertise<geometry_msgs::PoseStamped>("backend_pose_imu_viz", 10);
+  pub_odometry_ = pnh_.advertise<nav_msgs::Odometry>("backend_odometry", 10);
+  pub_gyro_bias_ =
+      pnh_.advertise<geometry_msgs::Vector3Stamped>("backend_gyro_bias", 10);
+  pub_acc_bias_ =
+      pnh_.advertise<geometry_msgs::Vector3Stamped>("backend_acc_bias", 10);
   pub_points_ =
       pnh_.advertise<PointCloud>("backend_points", 10);
 }
@@ -62,7 +69,11 @@ void CeresBackendPublisher::publishImuPose(const ViNodeState& state,
 
   size_t n_pose_sub = pub_imu_pose_.getNumSubscribers();
   size_t n_pose_viz_sub = pub_imu_pose_viz_.getNumSubscribers();
-  if (n_pose_sub == 0 && n_pose_viz_sub == 0)
+  size_t n_odometry_sub = pub_odometry_.getNumSubscribers();
+  size_t n_gyro_bias_sub = pub_gyro_bias_.getNumSubscribers();
+  size_t n_acc_bias_sub = pub_acc_bias_.getNumSubscribers();
+  if (n_pose_sub == 0 && n_pose_viz_sub == 0 && n_odometry_sub == 0 &&
+      n_gyro_bias_sub == 0 && n_acc_bias_sub == 0)
   {
     return;
   }
@@ -71,6 +82,48 @@ void CeresBackendPublisher::publishImuPose(const ViNodeState& state,
   Eigen::Quaterniond q = state.get_T_W_B().getRotation().toImplementation();
   Eigen::Vector3d p = state.get_T_W_B().getPosition();
   ros::Time time = ros::Time().fromNSec(timestamp);
+  const Eigen::Vector3d velocity = state.get_W_v_B();
+  const Eigen::Vector3d gyro_bias = state.getGyroBias();
+  const Eigen::Vector3d acc_bias = state.getAccBias();
+
+  if (n_odometry_sub > 0)
+  {
+    nav_msgs::Odometry message;
+    message.header.seq = seq;
+    message.header.stamp = time;
+    message.header.frame_id = kWorldFrame;
+    message.child_frame_id = "imu";
+    message.pose.pose.position.x = p.x();
+    message.pose.pose.position.y = p.y();
+    message.pose.pose.position.z = p.z();
+    message.pose.pose.orientation.x = q.x();
+    message.pose.pose.orientation.y = q.y();
+    message.pose.pose.orientation.z = q.z();
+    message.pose.pose.orientation.w = q.w();
+    message.twist.twist.linear.x = velocity.x();
+    message.twist.twist.linear.y = velocity.y();
+    message.twist.twist.linear.z = velocity.z();
+    pub_odometry_.publish(message);
+  }
+
+  geometry_msgs::Vector3Stamped bias_message;
+  bias_message.header.seq = seq;
+  bias_message.header.stamp = time;
+  bias_message.header.frame_id = "imu";
+  if (n_gyro_bias_sub > 0)
+  {
+    bias_message.vector.x = gyro_bias.x();
+    bias_message.vector.y = gyro_bias.y();
+    bias_message.vector.z = gyro_bias.z();
+    pub_gyro_bias_.publish(bias_message);
+  }
+  if (n_acc_bias_sub > 0)
+  {
+    bias_message.vector.x = acc_bias.x();
+    bias_message.vector.y = acc_bias.y();
+    bias_message.vector.z = acc_bias.z();
+    pub_acc_bias_.publish(bias_message);
+  }
 
   if (n_pose_sub > 0)
   {

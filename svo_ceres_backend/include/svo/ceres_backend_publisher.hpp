@@ -62,6 +62,9 @@ private:
   // publisher helpers
   ros::Publisher pub_imu_pose_;
   ros::Publisher pub_imu_pose_viz_;
+  ros::Publisher pub_odometry_;
+  ros::Publisher pub_gyro_bias_;
+  ros::Publisher pub_acc_bias_;
   ros::Publisher pub_points_;
 
   // publisher functions
