@@ -327,6 +327,7 @@ bool SvoInterface::setImuPrior(const int64_t timestamp_nanoseconds)
 
 void SvoInterface::monoCallback(const sensor_msgs::ImageConstPtr& msg)
 {
+  std::lock_guard<std::mutex> pipeline_lock(pipeline_mutex_);
   if(idle_)
     return;
 
@@ -366,6 +367,7 @@ void SvoInterface::stereoCallback(
     const sensor_msgs::ImageConstPtr& msg0,
     const sensor_msgs::ImageConstPtr& msg1)
 {
+  std::lock_guard<std::mutex> pipeline_lock(pipeline_mutex_);
   if(idle_)
     return;
 
@@ -409,6 +411,7 @@ void SvoInterface::imuCallback(const sensor_msgs::ImuConstPtr& msg)
 
 void SvoInterface::inputKeyCallback(const std_msgs::StringConstPtr& key_input)
 {
+  std::lock_guard<std::mutex> pipeline_lock(pipeline_mutex_);
   std::string remote_input = key_input->data;
   char input = remote_input.c_str()[0];
   switch(input)
@@ -419,7 +422,10 @@ void SvoInterface::inputKeyCallback(const std_msgs::StringConstPtr& key_input)
       break;
     case 'r':
       svo_->reset();
-      idle_ = true;
+      // FrameHandlerBase::reset() is deferred until the end of the next
+      // frame. Keep callbacks enabled so that frame can retire the frontend
+      // map and Ceres backend before a subsequent START command.
+      idle_ = false;
       SVO_INFO_STREAM("SVO user input: RESET");
       break;
     case 's':

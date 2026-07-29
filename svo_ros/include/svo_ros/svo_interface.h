@@ -1,5 +1,6 @@
 #pragma once
 
+#include <mutex>
 #include <thread>
 
 #include <ros/ros.h>
@@ -59,6 +60,10 @@ public:
   bool quit_ = false;
   bool idle_ = false;
   bool automatic_reinitialization_ = false;
+  // Remote reset/start commands arrive on ROS's callback thread while images
+  // are processed on image_thread_. Resetting the Ceres backend concurrently
+  // with addFrameBundle() invalidates backend state underneath the optimizer.
+  std::mutex pipeline_mutex_;
 
   SvoInterface(const PipelineType& pipeline_type,
           const ros::NodeHandle& nh,
