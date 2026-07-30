@@ -74,8 +74,21 @@ UpdateResult FrameHandlerMono::processFirstFrame()
   }
   const auto res = initializer_->addFrameBundle(new_frames_);
 
-  if(res == InitResult::kTracking)
-    return UpdateResult::kDefault;
+  switch(res)
+  {
+    case InitResult::kTracking:
+      return UpdateResult::kDefault;
+    case InitResult::kNoKeyframe:
+      VLOG(2) << "Init: relative-pose estimate not yet reliable; "
+                 "keeping tracks and waiting for another frame.";
+      return UpdateResult::kDefault;
+    case InitResult::kFailure:
+      VLOG(2) << "Init: image-pair estimate failed; keeping the initializer "
+                 "active and waiting for another frame.";
+      return UpdateResult::kDefault;
+    case InitResult::kSuccess:
+      break;
+  }
 
   // make old frame keyframe
   initializer_->frames_ref_->setKeyframe();
