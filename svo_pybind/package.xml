@@ -1,0 +1,17 @@
+<?xml version="1.0"?>
+<package format="2">
+  <name>svo_pybind</name>
+  <version>0.1.0</version>
+  <description>Non-ROS pybind11 interface for SVO.</description>
+  <maintainer email="matteo@example.com">SVO Habitat integration</maintainer>
+  <license>GPLv3</license>
+  <buildtool_depend>catkin</buildtool_depend>
+  <build_depend>catkin_simple</build_depend>
+  <build_depend>svo</build_depend>
+  <build_depend>svo_common</build_depend>
+  <build_depend>vikit_cameras</build_depend>
+  <build_depend>pybind11</build_depend>
+  <exec_depend>svo</exec_depend>
+  <exec_depend>svo_common</exec_depend>
+  <exec_depend>vikit_cameras</exec_depend>
+</package>
