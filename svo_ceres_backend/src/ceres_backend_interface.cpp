@@ -192,7 +192,13 @@ void CeresBackendInterface::loadMapFromBundleAdjustment(
     imu_handler_->setAccelerometerBias(speed_and_bias.tail<3>());
     imu_handler_->setGyroscopeBias(speed_and_bias.segment<3>(3));
 
-    publisher_->addFrame(last_added_nframe_imu_);
+    // A publisher is optional. In the direct pybind11 path no ROS publisher
+    // is constructed, while the optimizer and frontend map handoff are still
+    // fully functional.
+    if (publisher_)
+    {
+      publisher_->addFrame(last_added_nframe_imu_);
+    }
   }
 
   // shift state
@@ -331,7 +337,14 @@ void CeresBackendInterface::bundleAdjustment(const FrameBundlePtr& frame_bundle)
   {
     g_permon_backend_->log("pre_optim_time", timer.stop());
   }
-  wait_condition_.notify_one();
+  if (thread_)
+  {
+    wait_condition_.notify_one();
+  }
+  else if (backend_.numFrames() > 1 && !active_keyframes_.empty())
+  {
+    optimizationStep();
+  }
 }
 
 // Add all landmarks and observations of frame (under certain criteria)
@@ -609,130 +622,112 @@ void CeresBackendInterface::optimizationLoop()
       {
         return;
       }
-
-      vk::Timer timer;
-      {
-        std::lock_guard<std::mutex> lock(w_T_correction_mut_);
-        if (is_w_T_valid_)
-        {
-          backend_.removeAllPoseFixation();
-          backend_.transformMap(
-              w_T_correction_to_apply_,
-              optimizer_options_.remove_marginalization_term_after_correction_,
-              optimizer_options_.recalculate_imu_terms_after_loop);
-          for (const FramePtr& f : active_keyframes_)
-          {
-            f->accumulated_w_T_correction_ =
-                w_T_correction_to_apply_ * f->accumulated_w_T_correction_;
-          }
-          backend_.setOldestFrameFixed();
-          is_w_T_valid_ = false;
-        }
-      }
-
-      timer.start();
-      MarginalizationTiming mag_timing;
-      // Marginalization -------------------------------------------------------
-      if (optimizer_options_.marginalize)
-      {
-        // add 1 here because we perform marginalization before optimization, so
-        // we want to keep one more frame than after
-        if (!backend_.applyMarginalizationStrategy(
-                optimizer_options_.num_keyframes,
-                optimizer_options_.num_imu_frames + 1, &mag_timing))
-        {
-          LOG(ERROR) << "Marginalization failed!";
-        }
-        updateActiveKeyframes();
-      }
-      if (g_permon_backend_)
-      {
-        g_permon_backend_->log("marginalization", timer.stop());
-        for (const auto k : MarginalizationTiming::names_)
-        {
-          g_permon_backend_->log(k, mag_timing.get(k));
-        }
-      }
-
-      // update fixation
-      timer.start();
-      if (!backend_.needPoseFixation())
-      {
-        backend_.removeAllPoseFixation();
-        backend_.setAllFixedLandmarksEnabled(true);
-        lock_to_fixed_landmarks_ = true;
-      }
-      else
-      {
-        backend_.setAllFixedLandmarksEnabled(false);
-        if (!backend_.hasFixedPose())
-        {
-          backend_.setOldestFrameFixed();
-        }
-        lock_to_fixed_landmarks_ = false;
-      }
-      if (g_permon_backend_)
-      {
-        g_permon_backend_->log("fixation", timer.stop());
-      }
-
-      // Optimization ----------------------------------------------------------
-      if (g_permon_backend_)
-      {
-        g_permon_backend_->log("n_fixed_lm", backend_.numFixedLandmarks());
-      }
-      timer.start();
-      {
-        if (skip_optimization_once_)
-        {
-          skip_optimization_once_ = false;
-        }
-        else
-        {
-          backend_.optimize(optimizer_options_.num_iterations,
-                            optimizer_options_.num_threads,
-                            optimizer_options_.verbose);
-        }
-      }
-      if (g_permon_backend_)
-      {
-        g_permon_backend_->log("ceres_time", timer.stop());
-      }
-
-      last_optimized_nframe_.store(last_added_nframe_images_);
-      if (g_permon_backend_)
-      {
-        g_permon_backend_->log("tot_time",
-                               timers_[last_optimized_nframe_.load()].stop());
-        g_permon_backend_->writeToFile();
-        timers_.erase(timers_.find(last_optimized_nframe_.load()));
-      }
-
-      // Publish pose and visualize makers
-      Transformation T_WS;
-      bool success = backend_.get_T_WS(last_optimized_nframe_.load(), T_WS);
-      DEBUG_CHECK(success) << "Could not get latest Transformation from ceres "
-                              "optimizer";
-      SpeedAndBias speed_and_bias;
-      success =
-          backend_.getSpeedAndBias(last_optimized_nframe_, speed_and_bias);
-      DEBUG_CHECK(success) << "Could not get latest speed/bias from ceres "
-                              "optimizer";
-      last_state_.set_T_W_B(T_WS);
-      last_state_.set_W_v_B(speed_and_bias.head<3>());
-      last_state_.setAccBias(speed_and_bias.tail<3>());
-      last_state_.setGyroBias(speed_and_bias.segment<3>(3));
-
-      // publish current estimation
-      if (publisher_)
-      {
-        publisher_->publish(last_state_, last_added_frame_stamp_ns_,
-                            last_optimized_nframe_.load());
-      }
+      optimizationStep();
     }  // release backend mutex.
   }
 
   VLOG(1) << "Optimization thread ended.";
+}
+
+void CeresBackendInterface::optimizationStep()
+{
+  vk::Timer timer;
+  {
+    std::lock_guard<std::mutex> lock(w_T_correction_mut_);
+    if (is_w_T_valid_)
+    {
+      backend_.removeAllPoseFixation();
+      backend_.transformMap(
+          w_T_correction_to_apply_,
+          optimizer_options_.remove_marginalization_term_after_correction_,
+          optimizer_options_.recalculate_imu_terms_after_loop);
+      for (const FramePtr& f : active_keyframes_)
+      {
+        f->accumulated_w_T_correction_ =
+            w_T_correction_to_apply_ * f->accumulated_w_T_correction_;
+      }
+      backend_.setOldestFrameFixed();
+      is_w_T_valid_ = false;
+    }
+  }
+
+  timer.start();
+  MarginalizationTiming mag_timing;
+  if (optimizer_options_.marginalize)
+  {
+    if (!backend_.applyMarginalizationStrategy(
+            optimizer_options_.num_keyframes,
+            optimizer_options_.num_imu_frames + 1, &mag_timing))
+    {
+      LOG(ERROR) << "Marginalization failed!";
+    }
+    updateActiveKeyframes();
+  }
+  if (g_permon_backend_)
+  {
+    g_permon_backend_->log("marginalization", timer.stop());
+    for (const auto k : MarginalizationTiming::names_)
+      g_permon_backend_->log(k, mag_timing.get(k));
+  }
+
+  timer.start();
+  if (!backend_.needPoseFixation())
+  {
+    backend_.removeAllPoseFixation();
+    backend_.setAllFixedLandmarksEnabled(true);
+    lock_to_fixed_landmarks_ = true;
+  }
+  else
+  {
+    backend_.setAllFixedLandmarksEnabled(false);
+    if (!backend_.hasFixedPose())
+      backend_.setOldestFrameFixed();
+    lock_to_fixed_landmarks_ = false;
+  }
+  if (g_permon_backend_)
+    g_permon_backend_->log("fixation", timer.stop());
+
+  if (g_permon_backend_)
+    g_permon_backend_->log("n_fixed_lm", backend_.numFixedLandmarks());
+  timer.start();
+  if (skip_optimization_once_)
+  {
+    skip_optimization_once_ = false;
+  }
+  else
+  {
+    backend_.optimize(optimizer_options_.num_iterations,
+                      optimizer_options_.num_threads,
+                      optimizer_options_.verbose);
+  }
+  if (g_permon_backend_)
+    g_permon_backend_->log("ceres_time", timer.stop());
+
+  last_optimized_nframe_.store(last_added_nframe_images_);
+  if (g_permon_backend_)
+  {
+    g_permon_backend_->log(
+        "tot_time", timers_[last_optimized_nframe_.load()].stop());
+    g_permon_backend_->writeToFile();
+    timers_.erase(timers_.find(last_optimized_nframe_.load()));
+  }
+
+  Transformation T_WS;
+  bool success = backend_.get_T_WS(last_optimized_nframe_.load(), T_WS);
+  DEBUG_CHECK(success) << "Could not get latest Transformation from ceres optimizer";
+  SpeedAndBias speed_and_bias;
+  success = backend_.getSpeedAndBias(last_optimized_nframe_, speed_and_bias);
+  DEBUG_CHECK(success) << "Could not get latest speed/bias from ceres optimizer";
+  last_state_.set_T_W_B(T_WS);
+  last_state_.set_W_v_B(speed_and_bias.head<3>());
+  last_state_.setAccBias(speed_and_bias.tail<3>());
+  last_state_.setGyroBias(speed_and_bias.segment<3>(3));
+
+  if (publisher_)
+  {
+    publisher_->publish(last_state_, last_added_frame_stamp_ns_,
+                        last_optimized_nframe_.load());
+  }
 }
 
 // Set the IMU and the parameters in backend

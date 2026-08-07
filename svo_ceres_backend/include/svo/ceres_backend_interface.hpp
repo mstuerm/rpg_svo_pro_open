@@ -268,6 +268,9 @@ protected:
    */
   void optimizationLoop();
 
+  /// Run one optimization cycle. mutex_backend_ must already be locked.
+  void optimizationStep();
+
   /**
    * @brief Update the active keyframes, i.e. the keyframes that are contained
    *        in the backend.

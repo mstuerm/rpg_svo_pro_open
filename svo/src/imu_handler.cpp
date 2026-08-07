@@ -180,7 +180,11 @@ bool ImuHandler::getMeasurements(
   for(ImuMeasurements::iterator it=measurements_.begin();
       it!=measurements_.end(); ++it)
   {
-    if(!it2_set && it->timestamp_ < t2)
+    // A simulator commonly delivers the IMU sample and camera frame with the
+    // same timestamp. Accept that exact endpoint; using a strict comparison
+    // selected the t1 sample for both interval edges at exactly synchronized
+    // camera/IMU endpoints.
+    if(!it2_set && it->timestamp_ <= t2)
     {
       it2 = it;
       it2_set = true;
@@ -606,4 +610,3 @@ bool ImuHandler::waitTill(const double img_timestamp_sec,
 }
 
 } // namespace svo
-

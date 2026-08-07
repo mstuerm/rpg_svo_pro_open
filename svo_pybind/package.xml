@@ -9,9 +9,11 @@
   <build_depend>catkin_simple</build_depend>
   <build_depend>svo</build_depend>
   <build_depend>svo_common</build_depend>
+  <build_depend>svo_ceres_backend</build_depend>
   <build_depend>vikit_cameras</build_depend>
   <build_depend>pybind11</build_depend>
   <exec_depend>svo</exec_depend>
   <exec_depend>svo_common</exec_depend>
+  <exec_depend>svo_ceres_backend</exec_depend>
   <exec_depend>vikit_cameras</exec_depend>
 </package>
