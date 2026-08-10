@@ -7,6 +7,7 @@
 #include <ros/time.h>
 
 #include <chrono>
+#include <algorithm>
 #include <cmath>
 #include <cstring>
 #include <memory>
@@ -208,14 +209,28 @@ class SvoPybind
 {
 public:
   SvoPybind(const std::string& config_path, const std::string& calib_path)
+    : config_path_(config_path), calib_path_(calib_path)
+  {
+    initialize();
+  }
+
+  ~SvoPybind() { closeImpl(); }
+
+  void initialize()
   {
     // SVO Pro is compiled with its ROS timing adapter and some backend paths
     // use ros::Time as a wall-clock abstraction. Standalone pybind does not
     // construct a NodeHandle, so initialize only the time subsystem. This
     // starts no ROS node, spinner, publisher, subscriber, or communication.
     ros::Time::init();
-    const YAML::Node config = YAML::LoadFile(config_path);
-    auto cameras = svo::CameraBundle::loadFromYaml(calib_path);
+    const YAML::Node config = YAML::LoadFile(config_path_);
+    // The Python cv2 wheel and this extension may load different OpenCV
+    // builds, so cv2.setNumThreads() does not reliably configure the runtime
+    // used by SVO. Keep OpenCV's process-global worker pool bounded here. A
+    // value of one also avoids creating a fresh lazy pool after every
+    // reconstructed episode graph.
+    cv::setNumThreads(value(config, "opencv_num_threads", 1));
+    auto cameras = svo::CameraBundle::loadFromYaml(calib_path_);
     if(cameras->numCameras() != 1)
       throw std::runtime_error("svo_pybind currently supports one camera");
     svo_ = std::make_shared<svo::FrameHandlerMono>(
@@ -226,9 +241,9 @@ public:
     if(value(config, "use_imu", false))
     {
       const svo::ImuCalibration imu_calibration =
-          svo::ImuHandler::loadCalibrationFromFile(calib_path);
+          svo::ImuHandler::loadCalibrationFromFile(calib_path_);
       const svo::ImuInitialization imu_initialization =
-          svo::ImuHandler::loadInitializationFromFile(calib_path);
+          svo::ImuHandler::loadInitializationFromFile(calib_path_);
       svo::IMUHandlerOptions imu_options;
       imu_options.temporal_stationary_check =
           value(config, "imu_temporal_stationary_check", false);
@@ -254,13 +269,18 @@ public:
       }
     }
     svo_->start();
+    closed_ = false;
+    ++generation_id_;
   }
+
+  void close() { closeImpl(); }
 
   void add_imu(
       const int64_t timestamp_ns,
       const py::array_t<double, py::array::c_style | py::array::forcecast>& acceleration,
       const py::array_t<double, py::array::c_style | py::array::forcecast>& angular_velocity)
   {
+    ensureOpen();
     if(!imu_handler_)
       throw std::runtime_error("SVO was constructed with use_imu=false");
     const auto acc = acceleration.request();
@@ -283,6 +303,12 @@ public:
 
   std::size_t num_imu_measurements() const { return num_imu_measurements_; }
   bool has_ceres_backend() const { return static_cast<bool>(ceres_backend_); }
+  std::size_t backend_num_frames() const
+  {
+    return ceres_backend_ ? ceres_backend_->getNumFrames() : 0u;
+  }
+  std::size_t generation_id() const { return generation_id_; }
+  bool is_closed() const { return closed_; }
 
   py::tuple latest_speed_bias() const
   {
@@ -301,6 +327,78 @@ public:
     return py::make_tuple(result, timestamp);
   }
 
+  py::dict latest_backend_state() const
+  {
+    ensureOpen();
+    py::array_t<double> pose({4, 4});
+    py::array_t<double> velocity_world(3);
+    py::array_t<double> gyro_bias(3);
+    py::array_t<double> accel_bias(3);
+    std::fill_n(pose.mutable_data(), 16,
+                std::numeric_limits<double>::quiet_NaN());
+    std::fill_n(velocity_world.mutable_data(), 3,
+                std::numeric_limits<double>::quiet_NaN());
+    std::fill_n(gyro_bias.mutable_data(), 3,
+                std::numeric_limits<double>::quiet_NaN());
+    std::fill_n(accel_bias.mutable_data(), 3,
+                std::numeric_limits<double>::quiet_NaN());
+
+    double timestamp_sec = std::numeric_limits<double>::quiet_NaN();
+    bool valid = false;
+    if(ceres_backend_ && ceres_backend_->getNumFrames() > 0)
+    {
+      if(backend_thread_started_)
+        throw std::runtime_error(
+            "Coherent backend state requires ba_parallelized=false");
+      Eigen::Matrix<double, 9, 1> speed_bias;
+      svo::Transformation T_WS;
+      ceres_backend_->getLatestSpeedBiasPose(
+          &speed_bias, &T_WS, &timestamp_sec);
+      const Eigen::Matrix4d pose_matrix = T_WS.getTransformationMatrix();
+      const Eigen::Vector3d velocity =
+          T_WS.getRotation().rotate(speed_bias.head<3>());
+      auto pose_view = pose.mutable_unchecked<2>();
+      for(ssize_t row = 0; row < 4; ++row)
+        for(ssize_t col = 0; col < 4; ++col)
+          pose_view(row, col) = pose_matrix(row, col);
+      std::memcpy(
+          velocity_world.mutable_data(), velocity.data(), 3 * sizeof(double));
+      std::memcpy(
+          gyro_bias.mutable_data(), speed_bias.data() + 3, 3 * sizeof(double));
+      std::memcpy(
+          accel_bias.mutable_data(), speed_bias.data() + 6, 3 * sizeof(double));
+      valid = pose_matrix.allFinite() && velocity.allFinite() &&
+              speed_bias.tail<6>().allFinite() && std::isfinite(timestamp_sec);
+    }
+
+    py::dict state;
+    state["pose_wb"] = pose;
+    state["velocity_world"] = velocity_world;
+    state["gyro_bias"] = gyro_bias;
+    state["accel_bias"] = accel_bias;
+    state["timestamp_sec"] = timestamp_sec;
+    state["valid"] = valid;
+    state["stage"] = static_cast<int>(svo_->stage());
+    state["backend_num_frames"] = backend_num_frames();
+    state["generation_id"] = generation_id_;
+    return state;
+  }
+
+  py::dict diagnostics() const
+  {
+    py::dict result;
+    result["closed"] = closed_;
+    result["generation_id"] = generation_id_;
+    result["num_imu_measurements"] = num_imu_measurements_;
+    result["latest_imu_timestamp_ns"] = latest_imu_timestamp_ns_;
+    result["backend_num_frames"] = backend_num_frames();
+    result["backend_thread_started"] = backend_thread_started_;
+    result["has_ceres_backend"] = has_ceres_backend();
+    result["stage"] = closed_ || !svo_
+        ? -1 : static_cast<int>(svo_->stage());
+    return result;
+  }
+
   py::tuple step(const py::array_t<uint8_t, py::array::c_style | py::array::forcecast>& image,
                  const int64_t timestamp_ns)
   {
@@ -317,16 +415,44 @@ public:
 
   void reset()
   {
-    svo_->reset();
-    svo_->start();
+    // Upstream CeresBackendInterface::reset() is deliberately not called: it
+    // is unimplemented and retains marginalization state. Reconstruct the
+    // complete object graph so an episode cannot inherit frames, priors, IMU
+    // samples, or a backend worker from its predecessor.
+    closeImpl();
+    latest_imu_timestamp_ns_ = -1;
+    num_imu_measurements_ = 0;
+    initialize();
   }
 
 private:
+  void ensureOpen() const
+  {
+    if(closed_ || !svo_)
+      throw std::runtime_error("SVO instance is closed");
+  }
+
+  void closeImpl()
+  {
+    if(closed_)
+      return;
+    if(ceres_backend_ && backend_thread_started_)
+      ceres_backend_->quitThread();
+    backend_thread_started_ = false;
+    // FrameHandler owns another shared reference to the backend. Destroy it
+    // first, then release our explicit backend and IMU references.
+    svo_.reset();
+    ceres_backend_.reset();
+    imu_handler_.reset();
+    closed_ = true;
+  }
+
   py::tuple process(
       const py::array_t<uint8_t, py::array::c_style | py::array::forcecast>& image,
       const py::array_t<float, py::array::c_style | py::array::forcecast>* depth,
       const int64_t timestamp_ns)
   {
+    ensureOpen();
     const auto image_info = image.request();
     if(image_info.ndim != 2)
       throw std::runtime_error("image must have shape (height, width)");
@@ -401,6 +527,10 @@ private:
   bool backend_thread_started_ = false;
   int64_t latest_imu_timestamp_ns_ = -1;
   std::size_t num_imu_measurements_ = 0;
+  std::string config_path_;
+  std::string calib_path_;
+  bool closed_ = true;
+  std::size_t generation_id_ = 0;
 };
 
 }  // namespace
@@ -415,6 +545,14 @@ PYBIND11_MODULE(svo_pybind, module)
       .def("add_imu", &SvoPybind::add_imu)
       .def_property_readonly("num_imu_measurements", &SvoPybind::num_imu_measurements)
       .def_property_readonly("has_ceres_backend", &SvoPybind::has_ceres_backend)
+      .def_property_readonly("backend_num_frames", &SvoPybind::backend_num_frames)
+      .def_property_readonly("generation_id", &SvoPybind::generation_id)
+      .def_property_readonly("is_closed", &SvoPybind::is_closed)
       .def("latest_speed_bias", &SvoPybind::latest_speed_bias)
-      .def("reset", &SvoPybind::reset);
+      .def("latest_backend_state", &SvoPybind::latest_backend_state)
+      .def("diagnostics", &SvoPybind::diagnostics)
+      .def("close", &SvoPybind::close,
+           py::call_guard<py::gil_scoped_release>())
+      .def("reset", &SvoPybind::reset,
+           py::call_guard<py::gil_scoped_release>());
 }
