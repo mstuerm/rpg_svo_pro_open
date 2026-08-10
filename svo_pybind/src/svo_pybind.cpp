@@ -17,6 +17,7 @@
 
 #include <svo/common/camera.h>
 #include <svo/common/frame.h>
+#include <svo/common/point.h>
 #include <svo/common/transformation.h>
 #include <svo/frame_handler_mono.h>
 #include <svo/imu_handler.h>
@@ -384,6 +385,59 @@ public:
     return state;
   }
 
+  py::dict latest_features() const
+  {
+    ensureOpen();
+    const auto frames = svo_->getLastFrames();
+    const std::size_t count = frames ? frames->at(0)->numFeatures() : 0u;
+    // This workspace vendors an older pybind11 whose brace initializer would
+    // otherwise select array_t(count, pointer). Use explicit shape containers.
+    const py::array::ShapeContainer pixel_shape{
+        static_cast<py::ssize_t>(count), static_cast<py::ssize_t>(2)};
+    const py::array::ShapeContainer position_shape{
+        static_cast<py::ssize_t>(count), static_cast<py::ssize_t>(3)};
+    py::array_t<double> pixels(pixel_shape);
+    py::array_t<double> landmark_positions_world(position_shape);
+    py::array_t<int64_t> landmark_ids(static_cast<py::ssize_t>(count));
+    py::array_t<uint8_t> has_landmark(static_cast<py::ssize_t>(count));
+    std::fill_n(landmark_positions_world.mutable_data(), 3 * count,
+                std::numeric_limits<double>::quiet_NaN());
+    std::fill_n(landmark_ids.mutable_data(), count, int64_t{-1});
+    std::fill_n(has_landmark.mutable_data(), count, uint8_t{0});
+
+    if(frames)
+    {
+      const auto& frame = frames->at(0);
+      auto pixels_view = pixels.mutable_unchecked<2>();
+      auto positions_view = landmark_positions_world.mutable_unchecked<2>();
+      auto ids_view = landmark_ids.mutable_unchecked<1>();
+      auto valid_view = has_landmark.mutable_unchecked<1>();
+      for(std::size_t index = 0; index < count; ++index)
+      {
+        pixels_view(index, 0) = frame->px_vec_(0, index);
+        pixels_view(index, 1) = frame->px_vec_(1, index);
+        const auto& landmark = frame->landmark_vec_.at(index);
+        if(landmark)
+        {
+          const Eigen::Vector3d& position = landmark->pos();
+          positions_view(index, 0) = position.x();
+          positions_view(index, 1) = position.y();
+          positions_view(index, 2) = position.z();
+          ids_view(index) = landmark->id();
+          valid_view(index) = 1;
+        }
+      }
+    }
+    py::dict result;
+    // Pixel coordinates are in the submitted image. Landmark positions are
+    // in SVO's current frontend world frame, not Habitat/Flightmare world.
+    result["pixels"] = pixels;
+    result["landmark_positions_world"] = landmark_positions_world;
+    result["landmark_ids"] = landmark_ids;
+    result["has_landmark"] = has_landmark;
+    return result;
+  }
+
   py::dict diagnostics() const
   {
     py::dict result;
@@ -550,6 +604,7 @@ PYBIND11_MODULE(svo_pybind, module)
       .def_property_readonly("is_closed", &SvoPybind::is_closed)
       .def("latest_speed_bias", &SvoPybind::latest_speed_bias)
       .def("latest_backend_state", &SvoPybind::latest_backend_state)
+      .def("latest_features", &SvoPybind::latest_features)
       .def("diagnostics", &SvoPybind::diagnostics)
       .def("close", &SvoPybind::close,
            py::call_guard<py::gil_scoped_release>())
