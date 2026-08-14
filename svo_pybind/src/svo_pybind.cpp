@@ -400,10 +400,12 @@ public:
     py::array_t<double> landmark_positions_world(position_shape);
     py::array_t<int64_t> landmark_ids(static_cast<py::ssize_t>(count));
     py::array_t<uint8_t> has_landmark(static_cast<py::ssize_t>(count));
+    py::array_t<uint8_t> is_seed(static_cast<py::ssize_t>(count));
     std::fill_n(landmark_positions_world.mutable_data(), 3 * count,
                 std::numeric_limits<double>::quiet_NaN());
     std::fill_n(landmark_ids.mutable_data(), count, int64_t{-1});
     std::fill_n(has_landmark.mutable_data(), count, uint8_t{0});
+    std::fill_n(is_seed.mutable_data(), count, uint8_t{0});
 
     if(frames)
     {
@@ -412,10 +414,12 @@ public:
       auto positions_view = landmark_positions_world.mutable_unchecked<2>();
       auto ids_view = landmark_ids.mutable_unchecked<1>();
       auto valid_view = has_landmark.mutable_unchecked<1>();
+      auto seed_view = is_seed.mutable_unchecked<1>();
       for(std::size_t index = 0; index < count; ++index)
       {
         pixels_view(index, 0) = frame->px_vec_(0, index);
         pixels_view(index, 1) = frame->px_vec_(1, index);
+        seed_view(index) = svo::isSeed(frame->type_vec_.at(index)) ? 1 : 0;
         const auto& landmark = frame->landmark_vec_.at(index);
         if(landmark)
         {
@@ -435,6 +439,7 @@ public:
     result["landmark_positions_world"] = landmark_positions_world;
     result["landmark_ids"] = landmark_ids;
     result["has_landmark"] = has_landmark;
+    result["is_seed"] = is_seed;
     return result;
   }
 
