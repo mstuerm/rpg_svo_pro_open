@@ -399,13 +399,21 @@ public:
     py::array_t<double> pixels(pixel_shape);
     py::array_t<double> landmark_positions_world(position_shape);
     py::array_t<int64_t> landmark_ids(static_cast<py::ssize_t>(count));
+    py::array_t<int64_t> track_ids(static_cast<py::ssize_t>(count));
     py::array_t<uint8_t> has_landmark(static_cast<py::ssize_t>(count));
     py::array_t<uint8_t> is_seed(static_cast<py::ssize_t>(count));
+    py::array_t<uint8_t> is_tracked(static_cast<py::ssize_t>(count));
+    py::array_t<double> reprojection_errors_px(
+        static_cast<py::ssize_t>(count));
     std::fill_n(landmark_positions_world.mutable_data(), 3 * count,
                 std::numeric_limits<double>::quiet_NaN());
     std::fill_n(landmark_ids.mutable_data(), count, int64_t{-1});
+    std::fill_n(track_ids.mutable_data(), count, int64_t{-1});
     std::fill_n(has_landmark.mutable_data(), count, uint8_t{0});
     std::fill_n(is_seed.mutable_data(), count, uint8_t{0});
+    std::fill_n(is_tracked.mutable_data(), count, uint8_t{0});
+    std::fill_n(reprojection_errors_px.mutable_data(), count,
+                std::numeric_limits<double>::quiet_NaN());
 
     if(frames)
     {
@@ -413,14 +421,23 @@ public:
       auto pixels_view = pixels.mutable_unchecked<2>();
       auto positions_view = landmark_positions_world.mutable_unchecked<2>();
       auto ids_view = landmark_ids.mutable_unchecked<1>();
+      auto track_ids_view = track_ids.mutable_unchecked<1>();
       auto valid_view = has_landmark.mutable_unchecked<1>();
       auto seed_view = is_seed.mutable_unchecked<1>();
+      auto tracked_view = is_tracked.mutable_unchecked<1>();
+      auto reprojection_view = reprojection_errors_px.mutable_unchecked<1>();
       for(std::size_t index = 0; index < count; ++index)
       {
         pixels_view(index, 0) = frame->px_vec_(0, index);
         pixels_view(index, 1) = frame->px_vec_(1, index);
         seed_view(index) = svo::isSeed(frame->type_vec_.at(index)) ? 1 : 0;
+        track_ids_view(index) = frame->track_id_vec_(index);
         const auto& landmark = frame->landmark_vec_.at(index);
+        const bool tracked =
+            (landmark && !svo::isFixedLandmark(frame->type_vec_[index]) &&
+             !svo::isMapPoint(frame->type_vec_[index])) ||
+            svo::isCornerEdgeletSeed(frame->type_vec_[index]);
+        tracked_view(index) = tracked ? 1 : 0;
         if(landmark)
         {
           const Eigen::Vector3d& position = landmark->pos();
@@ -429,6 +446,12 @@ public:
           positions_view(index, 2) = position.z();
           ids_view(index) = landmark->id();
           valid_view(index) = 1;
+          Eigen::Vector2d reprojected_pixel;
+          const auto projection = frame->cam()->project3(
+              frame->T_cam_world() * position, &reprojected_pixel);
+          if(projection)
+            reprojection_view(index) =
+                (reprojected_pixel - frame->px_vec_.col(index)).norm();
         }
       }
     }
@@ -438,8 +461,15 @@ public:
     result["pixels"] = pixels;
     result["landmark_positions_world"] = landmark_positions_world;
     result["landmark_ids"] = landmark_ids;
+    result["track_ids"] = track_ids;
     result["has_landmark"] = has_landmark;
     result["is_seed"] = is_seed;
+    // "tracked" follows Frame::numTrackedFeatures(): landmarks and matched
+    // seeds, excluding fixed/map landmarks. Residuals are geometric pixel
+    // reprojection errors under the current frontend pose and are NaN where a
+    // feature has no 3-D landmark or cannot be projected.
+    result["is_tracked"] = is_tracked;
+    result["reprojection_errors_px"] = reprojection_errors_px;
     return result;
   }
 
