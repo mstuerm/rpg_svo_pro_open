@@ -356,8 +356,11 @@ public:
       ceres_backend_->getLatestSpeedBiasPose(
           &speed_bias, &T_WS, &timestamp_sec);
       const Eigen::Matrix4d pose_matrix = T_WS.getTransformationMatrix();
-      const Eigen::Vector3d velocity =
-          T_WS.getRotation().rotate(speed_bias.head<3>());
+      // ImuError propagates speed_bias.head<3>() directly in the world-frame
+      // position update (r_WS += v_W * dt). It is therefore already W_v_S;
+      // rotating it once more by T_WS corrupts horizontal velocity whenever
+      // the vehicle yaws.
+      const Eigen::Vector3d velocity = speed_bias.head<3>();
       auto pose_view = pose.mutable_unchecked<2>();
       for(ssize_t row = 0; row < 4; ++row)
         for(ssize_t col = 0; col < 4; ++col)
