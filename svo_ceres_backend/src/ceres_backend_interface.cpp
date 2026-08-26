@@ -536,7 +536,11 @@ void CeresBackendInterface::updateFrameStateWithBackend(
     success = backend_.getSpeedAndBias(f->bundleId(), speed_bias);
     DEBUG_CHECK(success) << "Could not get speed/bias for frame bundle "
                          << f->bundleId() << " from backend";
-    f->setIMUState(T_WS.getRotation().rotate(speed_bias.block<3, 1>(0, 0)),
+    const Eigen::Vector3d velocity_world =
+        options_.rotate_world_velocity_for_frame_state
+            ? T_WS.getRotation().rotate(speed_bias.block<3, 1>(0, 0))
+            : speed_bias.block<3, 1>(0, 0);
+    f->setIMUState(velocity_world,
                    speed_bias.block<3, 1>(3, 0), speed_bias.block<3, 1>(6, 0));
   }
 }
@@ -556,7 +560,11 @@ void CeresBackendInterface::updateBundleStateWithBackend(
     success = backend_.getSpeedAndBias(frames->getBundleId(), speed_bias);
     DEBUG_CHECK(success) << "Could not get speed/bias for frame bundle "
                          << frames->getBundleId() << " from backend";
-    frames->setIMUState(T_WS.getRotation().rotate(speed_bias.block<3, 1>(0, 0)),
+    const Eigen::Vector3d velocity_world =
+        options_.rotate_world_velocity_for_frame_state
+            ? T_WS.getRotation().rotate(speed_bias.block<3, 1>(0, 0))
+            : speed_bias.block<3, 1>(0, 0);
+    frames->setIMUState(velocity_world,
                         speed_bias.block<3, 1>(3, 0),
                         speed_bias.block<3, 1>(6, 0));
   }

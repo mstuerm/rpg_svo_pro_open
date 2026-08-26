@@ -59,6 +59,12 @@ struct CeresBackendOptions
 
 struct CeresBackendInterfaceOptions
 {
+  // Historical SVO behavior rotates the latest Ceres speed vector again
+  // before storing it in Frame::imu_vel_w_. Ceres propagation treats this
+  // vector as world-frame velocity, so retain the behavior by default only
+  // to permit a controlled compatibility ablation.
+  bool rotate_world_velocity_for_frame_state = true;
+
   /// (!) Only add landmarks to backend with minimum number of observations
   size_t min_num_obs = 2u;
 

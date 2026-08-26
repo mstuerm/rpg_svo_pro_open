@@ -65,6 +65,8 @@ CeresBackendInterface::Ptr makeBackend(const ros::NodeHandle& pnh,
       (vk::param<int>(pnh, "ceres_max_fixed_landmarks", 50u));
 
   CeresBackendInterfaceOptions ba_interface_options;
+  ba_interface_options.rotate_world_velocity_for_frame_state =
+      vk::param<bool>(pnh, "backend_rotate_world_velocity_for_frame_state", true);
   ba_interface_options.min_num_obs =
       static_cast<size_t>(vk::param<int>(pnh, "backend_min_num_obs", 2));
   ba_interface_options.min_parallax_thresh =
@@ -107,4 +109,3 @@ CeresBackendInterface::Ptr makeBackend(const ros::NodeHandle& pnh,
 
 } // namespace vin_factory
 } // namespace svo
-

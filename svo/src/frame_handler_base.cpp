@@ -552,9 +552,21 @@ bool FrameHandlerBase::addFrameBundle(const FrameBundlePtr& frame_bundle)
     SVO_STOP_TIMER("frontend_time");
     g_permon->writeToFile();
   }
-  // Call callbacks.
-  VLOG(40) << "Triggering addFrameBundle() callbacks...";
-  triggerCallbacks(last_frames_);
+  // Do not hand a failed frontend frame to the VIO backend. In particular,
+  // a frame with no reprojected observations contains no visual constraint;
+  // adding it to the inertial optimizer can make the subsequent VIO update
+  // non-finite and terminate the process. The frontend's normal
+  // relocalization/reset path still receives the frame via last_frames_.
+  // The next successful frame supplies an IMU interval spanning this drop.
+  if (update_res_ != UpdateResult::kFailure)
+  {
+    VLOG(40) << "Triggering addFrameBundle() callbacks...";
+    triggerCallbacks(last_frames_);
+  }
+  else
+  {
+    SVO_WARN_STREAM("Dropping failed frontend frame before VIO backend update.");
+  }
   return true;
 }
 
