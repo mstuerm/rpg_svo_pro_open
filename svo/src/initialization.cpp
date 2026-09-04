@@ -8,6 +8,7 @@
 
 #include <svo/initialization.h>
 
+#include <cstdlib>
 #include <random> // std::mt19937
 #include <vector>
 
@@ -439,6 +440,10 @@ InitResult OneShotInit::addFrameBundle(const FrameBundlePtr &frames_cur)
               << " total_matches=" << matches_cur_ref.size() << std::endl;
 
   // to estimate pose of current frame we do pose optimization
+  const bool print_oneshot_diagnostics =
+      std::getenv("SVO_ONESHOT_DEBUG") != nullptr;
+  const size_t landmarks_before_pose_optimization =
+      frame_cur->numLandmarks();
   PoseOptimizer::SolverOptions options = PoseOptimizer::getDefaultSolverOptions();
   options.verbose = true;
   PoseOptimizer optimizer(options);
@@ -453,6 +458,17 @@ InitResult OneShotInit::addFrameBundle(const FrameBundlePtr &frames_cur)
     const PointPtr point = frame_cur->landmark_vec_.at(i);
     point->addObservation(frame_cur, i);
     // TODO: we should also remove references in previous frame.
+  }
+
+  if(print_oneshot_diagnostics)
+  {
+    std::cout << "OneShot init diagnostics: matches=" << matches_cur_ref.size()
+              << " depth_sampled=" << depth_image_count
+              << " depth_fallback=" << depth_fallback_count
+              << " landmarks_before_pose="
+              << landmarks_before_pose_optimization
+              << " landmarks_after_pose=" << frame_cur->numLandmarks()
+              << " required=" << options_.init_min_features << std::endl;
   }
 
   if(frames_cur->numLandmarks() < options_.init_min_features)
