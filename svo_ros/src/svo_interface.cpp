@@ -2,6 +2,13 @@
 
 #include <ros/callback_queue.h>
 
+#include <unordered_map>
+#include <unordered_set>
+
+#include <pcl/point_cloud.h>
+#include <pcl/point_types.h>
+#include <pcl_conversions/pcl_conversions.h>
+
 #include <svo_ros/svo_factory.h>
 #include <svo_ros/visualizer.h>
 #include <svo/common/frame.h>
@@ -75,6 +82,8 @@ SvoInterface::SvoInterface(
 
   visualizer_.reset(
         new Visualizer(svo_->options_.trace_dir, pnh_, ncam_->getNumCameras()));
+  pub_pampc_landmarks_ =
+      pnh_.advertise<pcl::PointCloud<pcl::PointXYZ>>("pampc_landmarks", 2);
 
   if(vk::param<bool>(pnh_, "use_imu", false))
   {
@@ -183,6 +192,7 @@ void SvoInterface::publishResults(
   }
 
   visualizer_->publishSvoInfo(svo_.get(), timestamp_nanoseconds);
+  publishPampcLandmarks(timestamp_nanoseconds);
   switch (svo_->stage())
   {
     case Stage::kTracking: {
@@ -276,6 +286,75 @@ void SvoInterface::publishResults(
 #endif
 }
 
+void SvoInterface::publishPampcLandmarks(
+    const int64_t timestamp_nanoseconds)
+{
+  using LandmarkCloud = pcl::PointCloud<pcl::PointXYZ>;
+  LandmarkCloud cloud;
+  cloud.header.frame_id = Visualizer::kWorldFrame;
+  pcl_conversions::toPCL(
+      ros::Time().fromNSec(timestamp_nanoseconds), cloud.header.stamp);
+
+  const FrameBundlePtr frames = svo_->getLastFrames();
+  if(!frames || frames->size() == 0u)
+  {
+    pampc_landmark_persistence_.clear();
+    pub_pampc_landmarks_.publish(cloud);
+    return;
+  }
+
+  const FramePtr& frame = frames->at(0);
+  std::unordered_set<int> present;
+  present.reserve(frame->num_features_);
+  for(std::size_t index = 0; index < frame->num_features_; ++index)
+  {
+    const PointPtr& landmark = frame->landmark_vec_.at(index);
+    if(landmark)
+      present.insert(landmark->id());
+  }
+
+  std::unordered_map<int, int> updated_persistence;
+  updated_persistence.reserve(present.size());
+  for(const int id : present)
+  {
+    const auto previous = pampc_landmark_persistence_.find(id);
+    updated_persistence[id] =
+        previous == pampc_landmark_persistence_.end() ? 1 : previous->second + 1;
+  }
+  pampc_landmark_persistence_.swap(updated_persistence);
+
+  cloud.reserve(frame->num_features_);
+  for(std::size_t index = 0; index < frame->num_features_; ++index)
+  {
+    const PointPtr& landmark = frame->landmark_vec_.at(index);
+    if(!landmark)
+      continue;
+    const FeatureType type = frame->type_vec_.at(index);
+    const bool tracked =
+        (!isFixedLandmark(type) && !isMapPoint(type)) ||
+        isCornerEdgeletSeed(type);
+    if(!tracked || pampc_landmark_persistence_[landmark->id()] < 3)
+      continue;
+
+    Eigen::Vector2d reprojected_pixel;
+    const auto projection = frame->cam()->project3(
+        frame->T_cam_world() * landmark->pos(), &reprojected_pixel);
+    if(!projection ||
+       !std::isfinite(reprojected_pixel.x()) ||
+       !std::isfinite(reprojected_pixel.y()) ||
+       (reprojected_pixel - frame->px_vec_.col(index)).norm() > 2.0)
+      continue;
+
+    const Eigen::Vector3d& position = landmark->pos();
+    if(!position.allFinite())
+      continue;
+    cloud.push_back(pcl::PointXYZ(
+        static_cast<float>(position.x()), static_cast<float>(position.y()),
+        static_cast<float>(position.z())));
+  }
+  pub_pampc_landmarks_.publish(cloud);
+}
+
 bool SvoInterface::setImuPrior(const int64_t timestamp_nanoseconds)
 {
   if(svo_->getBundleAdjuster())
@@ -325,10 +404,14 @@ bool SvoInterface::setImuPrior(const int64_t timestamp_nanoseconds)
   return true;
 }
 
-void SvoInterface::monoCallback(const sensor_msgs::ImageConstPtr& msg)
+namespace {
+void processMonoImage(
+    svo::SvoInterface* interface,
+    const sensor_msgs::ImageConstPtr& msg,
+    const sensor_msgs::ImageConstPtr& depth_msg)
 {
-  std::lock_guard<std::mutex> pipeline_lock(pipeline_mutex_);
-  if(idle_)
+  std::lock_guard<std::mutex> pipeline_lock(interface->pipeline_mutex_);
+  if(interface->idle_)
     return;
 
   cv::Mat image;
@@ -339,28 +422,62 @@ void SvoInterface::monoCallback(const sensor_msgs::ImageConstPtr& msg)
   catch (cv_bridge::Exception& e)
   {
     ROS_ERROR("cv_bridge exception: %s", e.what());
+    return;
+  }
+
+  if(depth_msg)
+  {
+    try
+    {
+      const cv::Mat depth = cv_bridge::toCvCopy(depth_msg, "32FC1")->image;
+      if(depth.size() != image.size())
+      {
+        ROS_ERROR("SVO OneShot depth dimensions (%dx%d) do not match RGB (%dx%d)",
+                  depth.cols, depth.rows, image.cols, image.rows);
+        return;
+      }
+      interface->svo_->setDepthPriorImage(depth);
+    }
+    catch (cv_bridge::Exception& e)
+    {
+      ROS_ERROR("SVO OneShot depth cv_bridge exception: %s", e.what());
+      return;
+    }
   }
 
   std::vector<cv::Mat> images;
   images.push_back(image.clone());
 
-  if(!setImuPrior(msg->header.stamp.toNSec()))
+  if(!interface->setImuPrior(msg->header.stamp.toNSec()))
   {
     VLOG(3) << "Could not align gravity! Attempting again in next iteration.";
     return;
   }
 
-  imageCallbackPreprocessing(msg->header.stamp.toNSec());
+  interface->imageCallbackPreprocessing(msg->header.stamp.toNSec());
 
-  processImageBundle(images, msg->header.stamp.toNSec());
+  interface->processImageBundle(images, msg->header.stamp.toNSec());
 
+  interface->publishResults(images, msg->header.stamp.toNSec());
 
-  publishResults(images, msg->header.stamp.toNSec());
+  if(interface->svo_->stage() == Stage::kPaused &&
+     interface->automatic_reinitialization_)
+    interface->svo_->start();
 
-  if(svo_->stage() == Stage::kPaused && automatic_reinitialization_)
-    svo_->start();
+  interface->imageCallbackPostprocessing();
+}
+}  // namespace
 
-  imageCallbackPostprocessing();
+void SvoInterface::monoCallback(const sensor_msgs::ImageConstPtr& msg)
+{
+  processMonoImage(this, msg, sensor_msgs::ImageConstPtr());
+}
+
+void SvoInterface::monoDepthCallback(
+    const sensor_msgs::ImageConstPtr& image_msg,
+    const sensor_msgs::ImageConstPtr& depth_msg)
+{
+  processMonoImage(this, image_msg, depth_msg);
 }
 
 void SvoInterface::stereoCallback(
@@ -422,6 +539,7 @@ void SvoInterface::inputKeyCallback(const std_msgs::StringConstPtr& key_input)
       break;
     case 'r':
       svo_->reset();
+      pampc_landmark_persistence_.clear();
       // FrameHandlerBase::reset() is deferred until the end of the next
       // frame. Keep callbacks enabled so that frame can retire the frontend
       // map and Ceres backend before a subsequent START command.
@@ -494,10 +612,30 @@ void SvoInterface::monoLoop()
   nh.setCallbackQueue(&queue);
 
   image_transport::ImageTransport it(nh);
-  std::string image_topic =
+  const std::string image_topic =
       vk::param<std::string>(pnh_, "cam0_topic", "camera/image_raw");
-  image_transport::Subscriber it_sub =
-      it.subscribe(image_topic, 5, &svo::SvoInterface::monoCallback, this);
+  const std::string depth_topic =
+      vk::param<std::string>(pnh_, "depth_topic", "");
+  image_transport::Subscriber it_sub;
+  std::unique_ptr<image_transport::SubscriberFilter> image_filter;
+  std::unique_ptr<image_transport::SubscriberFilter> depth_filter;
+  typedef message_filters::sync_policies::ExactTime<
+      sensor_msgs::Image, sensor_msgs::Image> ExactPolicy;
+  std::unique_ptr<message_filters::Synchronizer<ExactPolicy>> depth_sync;
+  if(depth_topic.empty())
+  {
+    it_sub = it.subscribe(image_topic, 5, &svo::SvoInterface::monoCallback, this);
+  }
+  else
+  {
+    image_filter.reset(new image_transport::SubscriberFilter(it, image_topic, 5));
+    depth_filter.reset(new image_transport::SubscriberFilter(it, depth_topic, 5));
+    depth_sync.reset(new message_filters::Synchronizer<ExactPolicy>(
+        ExactPolicy(10), *image_filter, *depth_filter));
+    depth_sync->registerCallback(
+        boost::bind(&svo::SvoInterface::monoDepthCallback, this, _1, _2));
+    SVO_INFO_STREAM("SvoNode: synchronized OneShot depth topic " << depth_topic);
+  }
 
   while(ros::ok() && !quit_)
   {

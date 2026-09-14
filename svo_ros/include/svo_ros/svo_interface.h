@@ -2,6 +2,7 @@
 
 #include <mutex>
 #include <thread>
+#include <unordered_map>
 
 #include <ros/ros.h>
 #include <std_msgs/String.h>    // user-input
@@ -39,6 +40,7 @@ public:
   ros::NodeHandle pnh_;
   PipelineType pipeline_type_;
   ros::Subscriber sub_remote_key_;
+  ros::Publisher pub_pampc_landmarks_;
   std::string remote_input_;
   std::unique_ptr<std::thread> imu_thread_;
   std::unique_ptr<std::thread> image_thread_;
@@ -64,6 +66,9 @@ public:
   // are processed on image_thread_. Resetting the Ceres backend concurrently
   // with addFrameBundle() invalidates backend state underneath the optimizer.
   std::mutex pipeline_mutex_;
+  // Consecutive current-frame observations used by the strict PAMPC
+  // landmark filter. This mirrors LeapCSVOEnv::_landmark_persistence.
+  std::unordered_map<int, int> pampc_landmark_persistence_;
 
   SvoInterface(const PipelineType& pipeline_type,
           const ros::NodeHandle& nh,
@@ -82,8 +87,12 @@ public:
       const std::vector<cv::Mat>& images,
       const int64_t timestamp_nanoseconds);
 
+  void publishPampcLandmarks(const int64_t timestamp_nanoseconds);
+
   // Subscription and callbacks
   void monoCallback(const sensor_msgs::ImageConstPtr& msg);
+  void monoDepthCallback(const sensor_msgs::ImageConstPtr& image_msg,
+                         const sensor_msgs::ImageConstPtr& depth_msg);
   void stereoCallback(
       const sensor_msgs::ImageConstPtr& msg0,
       const sensor_msgs::ImageConstPtr& msg1);
