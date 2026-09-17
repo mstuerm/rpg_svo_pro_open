@@ -15,15 +15,25 @@ execute_process(
           "import sysconfig; print(sysconfig.get_path('include'))"
   OUTPUT_VARIABLE SVO_PYTHON_INCLUDE_DIR
   OUTPUT_STRIP_TRAILING_WHITESPACE
-  COMMAND_ERROR_IS_FATAL ANY
+  RESULT_VARIABLE SVO_PYTHON_INCLUDE_RESULT
 )
+if(NOT SVO_PYTHON_INCLUDE_RESULT EQUAL 0 OR
+   NOT EXISTS "${SVO_PYTHON_INCLUDE_DIR}/Python.h")
+  message(FATAL_ERROR
+    "Could not determine Python headers using ${PYTHON_EXECUTABLE}")
+endif()
 execute_process(
   COMMAND "${PYTHON_EXECUTABLE}" -c
           "import os, sysconfig; print(os.path.join(sysconfig.get_config_var('LIBDIR'), sysconfig.get_config_var('LDLIBRARY')))"
   OUTPUT_VARIABLE SVO_PYTHON_LIBRARY
   OUTPUT_STRIP_TRAILING_WHITESPACE
-  COMMAND_ERROR_IS_FATAL ANY
+  RESULT_VARIABLE SVO_PYTHON_LIBRARY_RESULT
 )
+if(NOT SVO_PYTHON_LIBRARY_RESULT EQUAL 0 OR
+   NOT EXISTS "${SVO_PYTHON_LIBRARY}")
+  message(FATAL_ERROR
+    "Could not determine Python library using ${PYTHON_EXECUTABLE}")
+endif()
 set(PYTHON_INCLUDE_DIR "${SVO_PYTHON_INCLUDE_DIR}" CACHE PATH
     "Python include directory" FORCE)
 set(PYTHON_LIBRARY "${SVO_PYTHON_LIBRARY}" CACHE FILEPATH
