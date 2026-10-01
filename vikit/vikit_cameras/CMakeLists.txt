@@ -15,6 +15,7 @@ set(HEADERS
   include/vikit/cameras/equidistant_distortion.h
   include/vikit/cameras/equidistant_fisheye_geometry.h
   include/vikit/cameras/equidistant_fisheye_projection.h
+  include/vikit/cameras/double_sphere_projection.h
   include/vikit/cameras/omni_geometry.h
   include/vikit/cameras/omni_projection.h
   include/vikit/cameras/radial_tangential_distortion.h
@@ -35,6 +36,7 @@ set(SOURCES
   src/camera_yaml_serialization.cpp
   src/equidistant_fisheye_geometry.cpp
   src/equidistant_fisheye_projection.cpp
+  src/double_sphere_projection.cpp
   src/omni_geometry.cpp
   src/omni_projection.cpp
   src/ncamera_yaml_serialization.cpp

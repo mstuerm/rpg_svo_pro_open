@@ -12,6 +12,49 @@
 
 namespace svo {
 
+namespace {
+
+// Double-sphere cameras do not have a valid inverse projection over the
+// complete rectangular image.  Keep the existing feature/track semantics
+// unchanged and remove only keypoints for which the calibrated inverse
+// projection explicitly reports failure.  In particular, do not alter
+// OneShot thresholds or its feature ordering for valid keypoints.
+template<typename VectorType>
+void compactColumns(const std::vector<bool>& valid, VectorType* values)
+{
+  CHECK_NOTNULL(values);
+  Eigen::Index write = 0;
+  for(Eigen::Index read = 0; read < values->cols(); ++read)
+  {
+    if(valid.at(static_cast<size_t>(read)))
+    {
+      if(write != read)
+        values->col(write) = values->col(read);
+      ++write;
+    }
+  }
+  values->conservativeResize(Eigen::NoChange, write);
+}
+
+template<typename VectorType>
+void compactRows(const std::vector<bool>& valid, VectorType* values)
+{
+  CHECK_NOTNULL(values);
+  Eigen::Index write = 0;
+  for(Eigen::Index read = 0; read < values->rows(); ++read)
+  {
+    if(valid.at(static_cast<size_t>(read)))
+    {
+      if(write != read)
+        values->row(write) = values->row(read);
+      ++write;
+    }
+  }
+  values->conservativeResize(write, Eigen::NoChange);
+}
+
+}  // namespace
+
 FeatureTracker::FeatureTracker(
     const FeatureTrackerOptions& options,
     const DetectorOptions& detector_options,
@@ -62,6 +105,7 @@ size_t FeatureTracker::trackFrameBundle(const FrameBundlePtr& nframe_kp1)
     const FramePtr& cur_frame = nframe_kp1->at(frame_index);
     std::vector<size_t> remove_indices;
     Keypoints new_keypoints(2, tracks.size());
+    Bearings new_bearings(3, tracks.size());
     Scores new_scores(tracks.size());
     TrackIds new_track_ids(tracks.size());
     size_t new_keypoints_counter = 0;    
@@ -85,7 +129,18 @@ size_t FeatureTracker::trackFrameBundle(const FrameBundlePtr& nframe_kp1)
             ref_px_level_0, cur_px_level_0);
       if(success)
       {
+        Eigen::Vector3d bearing;
+        // Do this check before creating the FeatureRef.  Otherwise compacting
+        // the frame later would leave a valid track pointing at the old
+        // feature index, which corrupts FivePoint/OneShot disparity queries.
+        if(!cur_frame->cam()->backProject3(cur_px_level_0, &bearing))
+        {
+          remove_indices.push_back(track_index);
+          terminated_tracks_.at(frame_index).push_back(track);
+          continue;
+        }
         new_keypoints.col(new_keypoints_counter) = cur_px_level_0;
+        new_bearings.col(new_keypoints_counter) = bearing.normalized();
         new_scores(new_keypoints_counter) =
             ref_observation.getFrame()->score_vec_[ref_observation.getFeatureIndex()];
         new_track_ids(new_keypoints_counter) = track.getTrackId();
@@ -109,11 +164,8 @@ size_t FeatureTracker::trackFrameBundle(const FrameBundlePtr& nframe_kp1)
     cur_frame->px_vec_ = new_keypoints.leftCols(new_keypoints_counter);
     cur_frame->score_vec_ = new_scores.head(new_keypoints_counter);
     cur_frame->track_id_vec_ = new_track_ids.head(new_keypoints_counter);
+    cur_frame->f_vec_ = new_bearings.leftCols(new_keypoints_counter);
     cur_frame->num_features_ = new_keypoints_counter;
-
-    // Compute and normalize all bearing vectors.
-    frame_utils::computeNormalizedBearingVectors(
-          cur_frame->px_vec_, *cur_frame->cam(), &cur_frame->f_vec_);
 
     VLOG(4) << "Tracker: Frame-" << frame_index << " - tracked = " << new_keypoints_counter;
   }
@@ -146,13 +198,19 @@ size_t FeatureTracker::initializeNewTracks(const FrameBundlePtr& nframe)
           frame->img_pyr_, frame->getMask(), max_n_features, new_px, new_scores,
           new_levels, new_grads, new_types);
 
-    // Compute and normalize all bearing vectors.
+    // Compute bearings and remove only invalid inverse projections.  This is
+    // deliberately before the features are added to the frame/track list;
+    // OneShot initialization and all valid-feature ordering remain intact.
     std::vector<bool> success;
     frame->cam()->backProject3(new_px, &new_f, &success);
-    for (const bool s : success) {
-      CHECK(s);
-    }
-
+    std::vector<bool> valid(success.size(), true);
+    for(size_t k = 0; k < success.size(); ++k)
+      valid[k] = success[k];
+    compactColumns(valid, &new_px);
+    compactColumns(valid, &new_f);
+    compactRows(valid, &new_scores);
+    compactRows(valid, &new_levels);
+    compactColumns(valid, &new_grads);
     new_f = new_f.array().rowwise() / new_f.colwise().norm().array();
 
     // Add features to frame.

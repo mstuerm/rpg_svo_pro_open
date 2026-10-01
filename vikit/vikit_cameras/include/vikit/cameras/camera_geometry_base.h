@@ -87,7 +87,8 @@ public:
     kPinhole = 0,
     kUnifiedProjection = 1,
     kOmni = 2,
-    kEqFisheye = 3
+    kEqFisheye = 3,
+    kDoubleSphere = 4
   };
 
   /// Default constructor

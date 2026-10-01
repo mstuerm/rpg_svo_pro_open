@@ -11,6 +11,7 @@
 #include <functional>
 #include <future>
 #include <memory>
+#include <cmath>
 #include <opencv2/imgproc/imgproc.hpp>
 
 #include <svo/common/conversions.h>
@@ -49,6 +50,17 @@ inline double distanceFirstTwoKeyframes(svo::Map& map)
       (first_kf->T_world_imu().getPosition() -
        second_kf->T_world_imu().getPosition()).norm();
   return dist;
+}
+
+bool finiteFramePose(const svo::FramePtr& frame)
+{
+  if (!frame)
+    return false;
+  const auto position = frame->T_f_w_.getPosition();
+  const auto rotation = frame->T_f_w_.getRotation().getRotationMatrix();
+  return position.allFinite() && rotation.allFinite()
+      && std::isfinite(rotation.determinant())
+      && std::abs(rotation.determinant()) > 1e-6;
 }
 }
 
@@ -369,7 +381,30 @@ bool FrameHandlerBase::addFrameBundle(const FrameBundlePtr& frame_bundle)
   update_res_ = processFrameBundle();
 
   // We start the backend first, since it is the most time crirical
-  if (bundle_adjustment_)
+  // A failed frontend frame has no visual constraints.  Feeding it into the
+  // inertial backend is unsafe: the least-squares system can be singular and
+  // produce a NaN pose/quaternion before the normal failure path runs.
+  bool frontend_pose_finite = (update_res_ != UpdateResult::kFailure);
+  if (frontend_pose_finite)
+  {
+    for (size_t i = 0; i < new_frames_->size(); ++i)
+    {
+      if (!finiteFramePose(new_frames_->at(i)))
+      {
+        frontend_pose_finite = false;
+        break;
+      }
+    }
+  }
+  if (!frontend_pose_finite)
+  {
+    SVO_WARN_STREAM("Skipping VIO backend update for failed/non-finite frontend frame.");
+    update_res_ = UpdateResult::kFailure;
+    set_reset_ = true;
+    backend_reinit_ = true;
+  }
+
+  if (bundle_adjustment_ && frontend_pose_finite)
   {
 #ifdef SVO_LOOP_CLOSING
     // if we have loop closing module, see whether there is any correction we can do

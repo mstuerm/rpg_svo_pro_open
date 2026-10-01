@@ -63,12 +63,32 @@ void MiniLeastSquaresSolver<D, T, Implementation>::optimizeGaussNewton(State& st
       applyPrior(state);
     }
 
+    // Never pass an underconstrained/non-finite normal equation to Eigen's
+    // linear solver.  A failed visual frontend can legitimately produce no
+    // measurements; treating that iteration as a failed update preserves the
+    // last valid state and lets the caller relocalize/reset safely.
+    if(!H_.allFinite() || !g_.allFinite())
+    {
+      LOG(WARNING) << "Non-finite least-squares system; rolling back update.";
+      state = old_state;
+      stop_ = true;
+      break;
+    }
+
     // solve the linear system
     if(!solve(H_, g_, dx_))
     {
       LOG(WARNING) << "Matrix is close to singular! Stop Optimizing."
                    << "H = " << H_ << "g = " << g_;
       stop_ = true;
+    }
+
+    if(!dx_.allFinite())
+    {
+      LOG(WARNING) << "Non-finite least-squares step; rolling back update.";
+      state = old_state;
+      stop_ = true;
+      break;
     }
 
     // check if error increased since last optimization

@@ -5,6 +5,7 @@
 #include "vikit/cameras/ncamera.h"
 #include "vikit/cameras/radial_tangential_distortion.h"
 #include <vikit/cameras/equidistant_fisheye_geometry.h>
+#include <vikit/cameras/double_sphere_projection.h>
 #include "vikit/cameras/omni_geometry.h"
 
 #include <gtest/gtest.h>
@@ -209,6 +210,40 @@ TEST(CameraTest, EquidistantProjection)
   EXPECT_NEAR(ray[0], 0, 1e-7);
   EXPECT_NEAR(ray[1], 0, 1e-7);
   EXPECT_NEAR(ray[2], 1, 1e-7);
+}
+
+TEST(CameraTest, DoubleSphereProjection)
+{
+  vk::cameras::DoubleSphereProjection projection(
+      0.004885377269539489, 0.6462404388566619,
+      143.87211843661066, 143.9682508538796,
+      200.9521946229738, 204.0453847384708);
+  const Eigen::Vector3d landmark(0.2, -0.1, 1.0);
+  Eigen::Vector2d keypoint;
+  Eigen::Matrix<double, 2, 3> jacobian;
+  projection.project3(landmark, &keypoint, &jacobian);
+
+  Eigen::Vector3d bearing;
+  ASSERT_TRUE(projection.backProject3(keypoint, &bearing));
+  EXPECT_TRUE(EIGEN_MATRIX_NEAR(
+      landmark.normalized(), bearing.normalized(), 1e-10));
+
+  constexpr double kStep = 1e-6;
+  Eigen::Matrix<double, 2, 3> numeric_jacobian;
+  for(int axis = 0; axis < 3; ++axis)
+  {
+    Eigen::Vector3d positive = landmark;
+    Eigen::Vector3d negative = landmark;
+    positive[axis] += kStep;
+    negative[axis] -= kStep;
+    Eigen::Vector2d positive_pixel;
+    Eigen::Vector2d negative_pixel;
+    projection.project3(positive, &positive_pixel, nullptr);
+    projection.project3(negative, &negative_pixel, nullptr);
+    numeric_jacobian.col(axis) =
+        (positive_pixel - negative_pixel) / (2.0 * kStep);
+  }
+  EXPECT_TRUE(EIGEN_MATRIX_NEAR(jacobian, numeric_jacobian, 1e-5));
 }
 
 TEST_F(CamerasTest, OmniCameraInitialization)

@@ -82,6 +82,11 @@ bool PoseLocalParameterization::plus(const double* x, const double* delta,
 
   Quaternion q(x[6], x[3], x[4], x[5]);
   q = Quaternion::exp(delta_.tail<3>()) * q;
+  // The product of two unit quaternions can drift by a few ulps.  Ceres calls
+  // this operation repeatedly and the debug check below uses a deliberately
+  // tight tolerance, so restore the unit-quaternion invariant explicitly
+  // before exposing the updated pose.
+  q.normalize();
 
   // copy back
   x_plus_delta[0] = x[0] + delta[0];

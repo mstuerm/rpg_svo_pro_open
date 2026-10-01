@@ -418,6 +418,12 @@ bool getSceneDepth(const FramePtr& frame, double& depth_median, double& depth_mi
   if(depth_vec.empty())
   {
     SVO_WARN_STREAM("Cannot set scene depth. Frame has no point-observations!");
+    // Keep callers safe even when they historically ignored the boolean
+    // return value.  A failed frontend frame must never leave stale/NaN depth
+    // values that can poison the next VIO/backend update.
+    depth_median = 0.0;
+    depth_min = 0.0;
+    depth_max = 0.0;
     return false;
   }
   depth_median = vk::getMedian(depth_vec);

@@ -30,6 +30,7 @@ class AtanDistortion;
 class EquidistantDistortion;
 class NoDistortion;
 class RadialTangentialDistortion;
+class DoubleSphereProjection;
 
 typedef CameraGeometry<PinholeProjection<NoDistortion>> PinholeGeometry;
 typedef CameraGeometry<PinholeProjection<AtanDistortion>> PinholeAtanGeometry;
@@ -37,6 +38,7 @@ typedef CameraGeometry<PinholeProjection<EquidistantDistortion>>
     PinholeEquidistantGeometry;
 typedef CameraGeometry<PinholeProjection<RadialTangentialDistortion>>
     PinholeRadTanGeometry;
+typedef CameraGeometry<DoubleSphereProjection> DoubleSphereGeometry;
 class OmniGeometry;
 } // namespace cameras
 } // namespace vk

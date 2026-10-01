@@ -7,6 +7,7 @@
 #include "vikit/cameras/atan_distortion.h"
 #include "vikit/cameras/camera_geometry.h"
 #include "vikit/cameras/equidistant_distortion.h"
+#include "vikit/cameras/double_sphere_projection.h"
 #include "vikit/cameras/no_distortion.h"
 #include "vikit/cameras/pinhole_projection.h"
 #include "vikit/cameras/radial_tangential_distortion.h"
@@ -83,6 +84,12 @@ bool convert<std::shared_ptr<vk::cameras::CameraGeometryBase> >::decode(
       {
         camera.reset(new vk::cameras::OmniGeometry(
                     image_width, image_height, intrinsics));
+      }
+      else if(camera_type == "double_sphere" || camera_type == "ds")
+      {
+        camera.reset(new vk::cameras::DoubleSphereGeometry(
+                    image_width, image_height,
+                    vk::cameras::DoubleSphereProjection(intrinsics)));
       }
       else
       {
@@ -220,4 +227,3 @@ Node convert<vk::cameras::CameraGeometryBase>::encode(
 }
 
 }  // namespace YAML
-
