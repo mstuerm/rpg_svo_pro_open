@@ -286,9 +286,9 @@ protected:
   /**
    * @brief Update the state stored in the frame (bundle) with the backend
    */
-  void updateFrameStateWithBackend(const FramePtr& frame,
+  bool updateFrameStateWithBackend(const FramePtr& frame,
                                    const bool get_speed_bias);
-  void updateBundleStateWithBackend(const FrameBundlePtr& frames,
+  bool updateBundleStateWithBackend(const FrameBundlePtr& frames,
                                     const bool get_speed_bias);
 
   // Threading

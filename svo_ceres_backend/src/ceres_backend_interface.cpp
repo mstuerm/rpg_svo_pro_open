@@ -18,6 +18,16 @@ DEFINE_double(extrinsics_sigma_rel_orientation, 0.0,
 
 namespace svo
 {
+namespace
+{
+bool finiteBackendPose(const Transformation& pose)
+{
+  const auto position = pose.getPosition();
+  const auto rotation = pose.getRotation().getRotationMatrix();
+  return position.allFinite() && rotation.allFinite();
+}
+}
+
 CeresBackendInterface::CeresBackendInterface(
     const CeresBackendInterfaceOptions& options,
     const CeresBackendOptions& optimizer_options,
@@ -101,8 +111,13 @@ void CeresBackendInterface::loadMapFromBundleAdjustment(
     last_added_nframe_imu_ = new_frames->getBundleId();
 
     // Obtain motion prior ---------------------------------------------------
-    updateBundleStateWithBackend(new_frames, true);
-    have_motion_prior = true;
+    have_motion_prior = updateBundleStateWithBackend(new_frames, true);
+    if (!have_motion_prior)
+    {
+      LOG(ERROR) << "Dropping invalid optimized state for bundle "
+                 << new_frames->getBundleId()
+                 << "; it will not be used as an SVO motion prior.";
+    }
   }
   else
   {
@@ -140,7 +155,13 @@ void CeresBackendInterface::loadMapFromBundleAdjustment(
     for (FramePtr& keyframe : active_keyframes_)
     {
       DEBUG_CHECK(keyframe) << "Found nullptr keyframe";
-      updateFrameStateWithBackend(keyframe, false);
+      if (!updateFrameStateWithBackend(keyframe, false))
+      {
+        LOG(ERROR) << "Aborting SVO map update after invalid backend pose for "
+                   << "bundle " << keyframe->bundleId();
+        have_motion_prior = false;
+        return;
+      }
       n_frames_updated++;
     }
     VLOG(3) << "Updated " << n_frames_updated << " frames in map.";
@@ -157,7 +178,13 @@ void CeresBackendInterface::loadMapFromBundleAdjustment(
     {
       if (!last_frame->isKeyframe())
       {
-        updateFrameStateWithBackend(last_frame, true);
+        if (!updateFrameStateWithBackend(last_frame, true))
+        {
+          LOG(ERROR) << "Aborting last-frame update after invalid backend state "
+                     << "for bundle " << last_frame->bundleId();
+          have_motion_prior = false;
+          return;
+        }
       }
     }
 
@@ -521,21 +548,34 @@ bool CeresBackendInterface::addStatesAndInertialMeasurementsToBackend(
   return true;
 }
 
-void CeresBackendInterface::updateFrameStateWithBackend(
+bool CeresBackendInterface::updateFrameStateWithBackend(
     const FramePtr& f, const bool get_speed_bias)
 {
   Transformation T_WS;
   bool success = backend_.get_T_WS(f->bundleId(), T_WS);
+  if (!success || !finiteBackendPose(T_WS))
+  {
+    LOG(ERROR) << "Rejecting invalid backend pose for frame bundle "
+               << f->bundleId();
+    return false;
+  }
   T_WS.getRotation().normalize();
-  DEBUG_CHECK(success) << "Could not get state for frame bundle "
-                       << f->bundleId() << " from backend";
-  f->set_T_w_imu(T_WS);
+  if (!finiteBackendPose(T_WS))
+  {
+    LOG(ERROR) << "Rejecting backend pose with invalid normalized rotation for "
+               << "frame bundle " << f->bundleId();
+    return false;
+  }
+  SpeedAndBias speed_bias;
   if (get_speed_bias)
   {
-    SpeedAndBias speed_bias;
     success = backend_.getSpeedAndBias(f->bundleId(), speed_bias);
-    DEBUG_CHECK(success) << "Could not get speed/bias for frame bundle "
-                         << f->bundleId() << " from backend";
+    if (!success || !speed_bias.allFinite())
+    {
+      LOG(ERROR) << "Rejecting invalid backend speed/bias for frame bundle "
+                 << f->bundleId();
+      return false;
+    }
     const Eigen::Vector3d velocity_world =
         options_.rotate_world_velocity_for_frame_state
             ? T_WS.getRotation().rotate(speed_bias.block<3, 1>(0, 0))
@@ -543,23 +583,36 @@ void CeresBackendInterface::updateFrameStateWithBackend(
     f->setIMUState(velocity_world,
                    speed_bias.block<3, 1>(3, 0), speed_bias.block<3, 1>(6, 0));
   }
+  f->set_T_w_imu(T_WS);
+  return true;
 }
 
-void CeresBackendInterface::updateBundleStateWithBackend(
+bool CeresBackendInterface::updateBundleStateWithBackend(
     const FrameBundlePtr& frames, const bool get_speed_bias)
 {
   Transformation T_WS;
   bool success = backend_.get_T_WS(frames->getBundleId(), T_WS);
-  DEBUG_CHECK(success) << "Could not get state for frame bundle "
-                       << frames->getBundleId() << " from backend";
+  if (!success || !finiteBackendPose(T_WS))
+  {
+    LOG(ERROR) << "Rejecting invalid backend pose for bundle "
+               << frames->getBundleId();
+    return false;
+  }
+  SpeedAndBias speed_bias;
+  if (get_speed_bias)
+  {
+    success = backend_.getSpeedAndBias(frames->getBundleId(), speed_bias);
+    if (!success || !speed_bias.allFinite())
+    {
+      LOG(ERROR) << "Rejecting invalid backend speed/bias for bundle "
+                 << frames->getBundleId();
+      return false;
+    }
+  }
   frames->set_T_W_B(T_WS);
 
   if (get_speed_bias)
   {
-    SpeedAndBias speed_bias;
-    success = backend_.getSpeedAndBias(frames->getBundleId(), speed_bias);
-    DEBUG_CHECK(success) << "Could not get speed/bias for frame bundle "
-                         << frames->getBundleId() << " from backend";
     const Eigen::Vector3d velocity_world =
         options_.rotate_world_velocity_for_frame_state
             ? T_WS.getRotation().rotate(speed_bias.block<3, 1>(0, 0))
@@ -568,6 +621,7 @@ void CeresBackendInterface::updateBundleStateWithBackend(
                         speed_bias.block<3, 1>(3, 0),
                         speed_bias.block<3, 1>(6, 0));
   }
+  return true;
 }
 void CeresBackendInterface::reset()
 {
@@ -722,10 +776,22 @@ void CeresBackendInterface::optimizationStep()
 
   Transformation T_WS;
   bool success = backend_.get_T_WS(last_optimized_nframe_.load(), T_WS);
-  DEBUG_CHECK(success) << "Could not get latest Transformation from ceres optimizer";
+  if (!success || !finiteBackendPose(T_WS))
+  {
+    LOG(ERROR) << "Rejecting invalid optimized pose for bundle "
+               << last_optimized_nframe_.load()
+               << "; not publishing this backend update.";
+    return;
+  }
   SpeedAndBias speed_and_bias;
   success = backend_.getSpeedAndBias(last_optimized_nframe_, speed_and_bias);
-  DEBUG_CHECK(success) << "Could not get latest speed/bias from ceres optimizer";
+  if (!success || !speed_and_bias.allFinite())
+  {
+    LOG(ERROR) << "Rejecting invalid optimized speed/bias for bundle "
+               << last_optimized_nframe_.load()
+               << "; not publishing this backend update.";
+    return;
+  }
   last_state_.set_T_W_B(T_WS);
   last_state_.set_W_v_B(speed_and_bias.head<3>());
   last_state_.setAccBias(speed_and_bias.tail<3>());

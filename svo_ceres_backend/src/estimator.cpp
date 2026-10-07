@@ -42,6 +42,9 @@
 
 #include "svo/ceres_backend/estimator.hpp"
 
+#include <cmath>
+#include <Eigen/Core>
+
 #include <svo/common/conversions.h>
 #include <svo/common/point.h>
 
@@ -189,13 +192,22 @@ bool Estimator::addStates(const FrameBundleConstPtr& frame_bundle,
     // get the previous states
     BackendId T_WS_id = states_.ids.back();
     BackendId speed_and_bias_id = changeIdType(T_WS_id, IdType::ImuStates);
-    T_WS =
-        std::static_pointer_cast<ceres_backend::PoseParameterBlock>(
-          map_ptr_->parameterBlockPtr(T_WS_id.asInteger()))->estimate();
-    speed_and_bias =
-        std::static_pointer_cast<ceres_backend::SpeedAndBiasParameterBlock>(
-          map_ptr_->parameterBlockPtr(
-            speed_and_bias_id.asInteger()))->estimate();
+    bool state_is_valid = false;
+    std::tie(T_WS, state_is_valid) = getPoseEstimate(T_WS_id);
+    if (!state_is_valid)
+    {
+      LOG(ERROR) << "Refusing IMU propagation from invalid previous pose "
+                 << T_WS_id.asInteger();
+      return false;
+    }
+    std::tie(speed_and_bias, state_is_valid) =
+        getSpeedAndBiasEstimate(speed_and_bias_id);
+    if (!state_is_valid)
+    {
+      LOG(ERROR) << "Refusing IMU propagation from invalid previous "
+                 << "speed/bias state " << speed_and_bias_id.asInteger();
+      return false;
+    }
     //! @todo last_timestamp redundant because we already select imu
     //!       measurements for specific timespan
     int num_used_imu_measurements =
@@ -1484,25 +1496,28 @@ std::pair<Transformation, bool> Estimator::getPoseEstimate(BackendId id) const
   {
     return std::make_pair(Transformation(), false);
   }
-#ifndef NDEBUG
-  std::shared_ptr<ceres_backend::ParameterBlock> base_ptr =
-      map_ptr_->parameterBlockPtr(id.asInteger());
-  if (base_ptr != nullptr)
-  {
-    std::shared_ptr<ceres_backend::PoseParameterBlock> block_ptr =
-        std::dynamic_pointer_cast<ceres_backend::PoseParameterBlock>(base_ptr);
-    CHECK(block_ptr != nullptr) << "Incorrect pointer cast detected!";
-    return std::make_pair(block_ptr->estimate(), true);
-  }
-#else
   std::shared_ptr<ceres_backend::PoseParameterBlock> block_ptr =
       std::static_pointer_cast<ceres_backend::PoseParameterBlock>(
         map_ptr_->parameterBlockPtr(id.asInteger()));
   if (block_ptr != nullptr)
   {
+    // Do not construct a kindr quaternion from unchecked optimizer memory:
+    // its constructor/sanitizer may substitute identity while leaving other
+    // invalid state values in circulation. Reject the entire pose instead.
+    const double* p = block_ptr->parameters();
+    Eigen::Map<const Eigen::Vector3d> position(p);
+    Eigen::Map<const Eigen::Vector4d> quaternion_xyzw(p + 3);
+    const double quaternion_norm = quaternion_xyzw.norm();
+    if (!position.allFinite() || !quaternion_xyzw.allFinite() ||
+        !std::isfinite(quaternion_norm) || quaternion_norm < 1e-8)
+    {
+      LOG(ERROR) << "Rejecting invalid Ceres pose estimate for backend id "
+                 << id.asInteger() << " (position/quaternion is non-finite "
+                 << "or quaternion norm is zero)";
+      return std::make_pair(Transformation(), false);
+    }
     return std::make_pair(block_ptr->estimate(), true);
   }
-#endif
   return std::make_pair(Transformation(), false);
 }
 
@@ -1513,25 +1528,20 @@ std::pair<SpeedAndBias, bool> Estimator::getSpeedAndBiasEstimate(BackendId id) c
   {
     return std::make_pair(SpeedAndBias(), false);
   }
-#ifndef NDEBUG
-  std::shared_ptr<ceres_backend::ParameterBlock> base_ptr =
-      map_ptr_->parameterBlockPtr(id.asInteger());
-  if (base_ptr != nullptr)
-  {
-    std::shared_ptr<ceres_backend::SpeedAndBiasParameterBlock> block_ptr =
-        std::dynamic_pointer_cast<ceres_backend::SpeedAndBiasParameterBlock>(base_ptr);
-    CHECK(block_ptr != nullptr) << "Incorrect pointer cast detected!";
-    return std::make_pair(block_ptr->estimate(), true);
-  }
-#else
   std::shared_ptr<ceres_backend::SpeedAndBiasParameterBlock> block_ptr =
       std::static_pointer_cast<ceres_backend::SpeedAndBiasParameterBlock>(
         map_ptr_->parameterBlockPtr(id.asInteger()));
   if (block_ptr != nullptr)
   {
-    return std::make_pair(block_ptr->estimate(), true);
+    const SpeedAndBias estimate = block_ptr->estimate();
+    if (!estimate.allFinite())
+    {
+      LOG(ERROR) << "Rejecting non-finite Ceres speed/bias estimate for "
+                 << "backend id " << id.asInteger();
+      return std::make_pair(SpeedAndBias(), false);
+    }
+    return std::make_pair(estimate, true);
   }
-#endif
   return std::make_pair(SpeedAndBias(), false);
 }
 
