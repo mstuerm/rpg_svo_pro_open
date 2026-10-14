@@ -140,7 +140,10 @@ SvoInterface::SvoInterface(
 #endif
   }
 
-  svo_->start();
+  // A manual initialization workflow must not accumulate an IMU-only backend
+  // during takeoff/approach before its explicit reset/start request.
+  if (!vk::param<bool>(pnh_, "start_paused", false))
+    svo_->start();
 }
 
 SvoInterface::~SvoInterface()
