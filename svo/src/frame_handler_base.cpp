@@ -100,6 +100,19 @@ FrameHandlerBase::FrameHandlerBase(const BaseOptions& base_options, const Reproj
     g_permon->addTimer("point_optimizer");
     g_permon->addTimer("local_ba");
     g_permon->addTimer("frontend_time");
+    g_permon->addTimer("map_from_backend");
+    g_permon->addTimer("scale_seed_update");
+    g_permon->addTimer("backend_enqueue");
+    g_permon->addTimer("seed_update_overlap_last");
+    g_permon->addTimer("scene_depth");
+    g_permon->addTimer("kf_extra_map_points");
+    g_permon->addTimer("kf_upgrade_seeds");
+    g_permon->addTimer("kf_detector_occupancy");
+    g_permon->addTimer("kf_depth_add");
+    g_permon->addTimer("kf_seed_update_previous");
+    g_permon->addTimer("kf_seed_update_overlap");
+    g_permon->addTimer("kf_map_add");
+    g_permon->addTimer("kf_map_prune");
     g_permon->addLog("timestamp");
     g_permon->addLog("img_align_n_tracked");
     g_permon->addLog("repr_n_matches_local_map");
@@ -284,9 +297,11 @@ bool FrameHandlerBase::addFrameBundle(const FrameBundlePtr& frame_bundle)
                                               timestamp_backend_latest_);
     }
 
+    if (options_.trace_statistics) SVO_START_TIMER("map_from_backend");
     bundle_adjustment->loadMapFromBundleAdjustment(new_frames_,
                                                    last_frames_, map_,
                                                    have_motion_prior_);
+    if (options_.trace_statistics) SVO_STOP_TIMER("map_from_backend");
 
     if (bundle_adjustment->getNumFrames() > 0 && have_motion_prior_)
     {
@@ -341,8 +356,10 @@ bool FrameHandlerBase::addFrameBundle(const FrameBundlePtr& frame_bundle)
         //seeds with the new depth values
         frame_utils::getSceneDepth(last_frames_->frames_[0],
             depth_median_, depth_min_, depth_max_);
+        if (options_.trace_statistics) SVO_START_TIMER("scale_seed_update");
         depth_filter_->updateSeeds(overlap_kfs_.at(0),
                                    last_frames_->frames_[0]);
+        if (options_.trace_statistics) SVO_STOP_TIMER("scale_seed_update");
         VLOG(2) << "Adjusting SVO scale to backend";
       }
     }
@@ -386,7 +403,9 @@ bool FrameHandlerBase::addFrameBundle(const FrameBundlePtr& frame_bundle)
     }
 #endif
     VLOG(40) << "Call bundle adjustment.";
+    if (options_.trace_statistics) SVO_START_TIMER("backend_enqueue");
     bundle_adjustment_->bundleAdjustment(new_frames_);
+    if (options_.trace_statistics) SVO_STOP_TIMER("backend_enqueue");
   }
 
   // Information exchange between loop closing and global map

@@ -136,7 +136,9 @@ UpdateResult FrameHandlerMono::processFrame()
   VLOG(40) << "Updating seeds in overlapping keyframes...";
   // this is useful when the pipeline is with the backend,
   // where we should have more accurate pose at this moment
+  if (options_.trace_statistics) SVO_START_TIMER("seed_update_overlap_last");
   depth_filter_->updateSeeds(overlap_kfs_.at(0), lastFrame());
+  if (options_.trace_statistics) SVO_STOP_TIMER("seed_update_overlap_last");
 
   // ---------------------------------------------------------------------------
   // tracking
@@ -179,7 +181,9 @@ UpdateResult FrameHandlerMono::processFrame()
   // ---------------------------------------------------------------------------
   // select keyframe
   VLOG(40) << "===== Keyframe Selection =====";
+  if (options_.trace_statistics) SVO_START_TIMER("scene_depth");
   frame_utils::getSceneDepth(newFrame(), depth_median_, depth_min_, depth_max_);
+  if (options_.trace_statistics) SVO_STOP_TIMER("scene_depth");
   VLOG(40) << "Current Frame Depth: " << "min: " << depth_min_
            << ", max: " << depth_max_ << ", median: " << depth_median_;
   initializer_->setDepthPrior(depth_median_);
@@ -204,6 +208,7 @@ UpdateResult FrameHandlerMono::processFrame()
   // new keyframe selected
   if (depth_filter_->options_.extra_map_points)
   {
+    if (options_.trace_statistics) SVO_START_TIMER("kf_extra_map_points");
     depth_filter_->sec_feature_detector_->resetGrid();
     OccupandyGrid2D map_point_grid(depth_filter_->sec_feature_detector_->grid_);
     reprojector_utils::reprojectMapPoints(
@@ -212,8 +217,11 @@ UpdateResult FrameHandlerMono::processFrame()
     DepthFilter::ulock_t lock(depth_filter_->feature_detector_mut_);
     feature_detection_utils::mergeGrids(
           map_point_grid, &depth_filter_->sec_feature_detector_->grid_);
+    if (options_.trace_statistics) SVO_STOP_TIMER("kf_extra_map_points");
   }
+  if (options_.trace_statistics) SVO_START_TIMER("kf_upgrade_seeds");
   upgradeSeedsToFeatures(newFrame());
+  if (options_.trace_statistics) SVO_STOP_TIMER("kf_upgrade_seeds");
   // init new depth-filters, set feature-detection grid-cells occupied that
   // already have a feature
   //
@@ -222,32 +230,43 @@ UpdateResult FrameHandlerMono::processFrame()
   //       depth-filter
   //
   {
+    if (options_.trace_statistics) SVO_START_TIMER("kf_detector_occupancy");
     DepthFilter::ulock_t lock(depth_filter_->feature_detector_mut_);
     setDetectorOccupiedCells(0, depth_filter_->feature_detector_);
+    if (options_.trace_statistics) SVO_STOP_TIMER("kf_detector_occupancy");
 
   } // release lock
+  if (options_.trace_statistics) SVO_START_TIMER("kf_depth_add");
   depth_filter_->addKeyframe(
         newFrame(), depth_median_, 0.5*depth_min_, depth_median_*1.5);
+  if (options_.trace_statistics) SVO_STOP_TIMER("kf_depth_add");
 
   if(options_.update_seeds_with_old_keyframes)
   {
     VLOG(40) << "Updating seeds in current frame using last frame...";
+    if (options_.trace_statistics) SVO_START_TIMER("kf_seed_update_previous");
     depth_filter_->updateSeeds({ newFrame() }, lastFrameUnsafe());
+    if (options_.trace_statistics) SVO_STOP_TIMER("kf_seed_update_previous");
     VLOG(40) << "Updating seeds in current frame using overlapping keyframes...";
+    if (options_.trace_statistics) SVO_START_TIMER("kf_seed_update_overlap");
     for(const FramePtr& old_keyframe : overlap_kfs_.at(0))
       depth_filter_->updateSeeds({ newFrame() }, old_keyframe);
+    if (options_.trace_statistics) SVO_STOP_TIMER("kf_seed_update_overlap");
   }
 
   VLOG(40) << "Updating seeds in overlapping keyframes...";
 //  depth_filter_->updateSeeds(overlap_kfs_.at(0), newFrame());
 
   // add keyframe to map
+  if (options_.trace_statistics) SVO_START_TIMER("kf_map_add");
   map_->addKeyframe(newFrame(),
                     bundle_adjustment_type_==BundleAdjustmentType::kCeres);
+  if (options_.trace_statistics) SVO_STOP_TIMER("kf_map_add");
 
   // if limited number of keyframes, remove the one furthest apart
   if(options_.max_n_kfs > 2)
   {
+    if (options_.trace_statistics) SVO_START_TIMER("kf_map_prune");
     while(map_->size() > options_.max_n_kfs)
     {
       if(bundle_adjustment_type_==BundleAdjustmentType::kCeres)
@@ -261,6 +280,7 @@ UpdateResult FrameHandlerMono::processFrame()
         map_->removeKeyframe(furthest_frame->id());
       }
     }
+    if (options_.trace_statistics) SVO_STOP_TIMER("kf_map_prune");
   }
   return UpdateResult::kKeyframe;
 }
