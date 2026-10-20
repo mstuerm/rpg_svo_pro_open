@@ -1,6 +1,8 @@
 #include <svo_ros/svo_interface.h>
 
 #include <ros/callback_queue.h>
+#include <chrono>
+#include <std_msgs/Float64MultiArray.h>
 
 #include <unordered_map>
 #include <unordered_set>
@@ -408,12 +410,47 @@ bool SvoInterface::setImuPrior(const int64_t timestamp_nanoseconds)
 }
 
 namespace {
+// TX2_MONO_PROFILE_V1
+// Image transport's JPEG decoding happens BEFORE this callback. Entry age
+// includes render/network/queue/decode; do not mislabel it as queue time alone.
+class MonoCallbackTiming {
+ public:
+  explicit MonoCallbackTiming(const ros::Time& stamp)
+      : start_(Clock::now()), last_(start_) {
+    static ros::NodeHandle private_nh("~");
+    static ros::Publisher publisher = private_nh.advertise<std_msgs::Float64MultiArray>("mono_timing", 10);
+    publisher_ = publisher;
+    message_.data.assign(14, 0.0);
+    message_.data[0] = stamp.toSec();
+    message_.data[1] = ros::Time::now().toSec();
+    message_.data[2] = (message_.data[1]-message_.data[0])*1000.;
+  }
+  void mark(size_t index) {
+    const auto now = Clock::now();
+    message_.data[index] = std::chrono::duration<double, std::milli>(now-last_).count();
+    last_ = now;
+  }
+  void complete(int stage) { message_.data[12]=stage; message_.data[13]=1.; }
+  ~MonoCallbackTiming() {
+    message_.data[10] = std::chrono::duration<double, std::milli>(Clock::now()-start_).count();
+    message_.data[11] = ros::Time::now().toSec();
+    publisher_.publish(message_);
+  }
+ private:
+  using Clock = std::chrono::steady_clock;
+  Clock::time_point start_, last_;
+  ros::Publisher publisher_;
+  std_msgs::Float64MultiArray message_;
+};
+
 void processMonoImage(
     svo::SvoInterface* interface,
     const sensor_msgs::ImageConstPtr& msg,
     const sensor_msgs::ImageConstPtr& depth_msg)
 {
+  MonoCallbackTiming timing(msg->header.stamp);
   std::lock_guard<std::mutex> pipeline_lock(interface->pipeline_mutex_);
+  timing.mark(3);
   if(interface->idle_)
     return;
 
@@ -450,6 +487,7 @@ void processMonoImage(
 
   std::vector<cv::Mat> images;
   images.push_back(image.clone());
+  timing.mark(4);
 
   if(!interface->setImuPrior(msg->header.stamp.toNSec()))
   {
@@ -457,17 +495,21 @@ void processMonoImage(
     return;
   }
 
+  timing.mark(5);
   interface->imageCallbackPreprocessing(msg->header.stamp.toNSec());
-
+  timing.mark(6);
   interface->processImageBundle(images, msg->header.stamp.toNSec());
-
+  timing.mark(7);
   interface->publishResults(images, msg->header.stamp.toNSec());
+  timing.mark(8);
 
   if(interface->svo_->stage() == Stage::kPaused &&
      interface->automatic_reinitialization_)
     interface->svo_->start();
 
   interface->imageCallbackPostprocessing();
+  timing.mark(9);
+  timing.complete(static_cast<int>(interface->svo_->stage()));
 }
 }  // namespace
 
@@ -627,7 +669,14 @@ void SvoInterface::monoLoop()
   std::unique_ptr<message_filters::Synchronizer<ExactPolicy>> depth_sync;
   if(depth_topic.empty())
   {
-    it_sub = it.subscribe(image_topic, 5, &svo::SvoInterface::monoCallback, this);
+    // Latest waiting mono frame only; preserve the current depth/stereo paths.
+    const int image_queue_size = vk::param<int>(pnh_, "image_queue_size", 1);
+    if (image_queue_size < 1) {
+      ROS_FATAL("image_queue_size must be positive");
+      return;
+    }
+    ROS_INFO("TX2 mono image subscriber queue: %d", image_queue_size);
+    it_sub = it.subscribe(image_topic, image_queue_size, &svo::SvoInterface::monoCallback, this);
   }
   else
   {
