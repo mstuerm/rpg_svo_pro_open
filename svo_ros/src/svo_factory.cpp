@@ -1,4 +1,5 @@
 #include <ros/package.h>
+#include <limits>
 
 #include <svo/svo.h>
 #include <svo/common/imu_calibration.h>
@@ -131,6 +132,9 @@ InitializationOptions loadInitializationOptions(const ros::NodeHandle& pnh)
   o.init_min_tracked = vk::param<int>(pnh, "init_min_tracked", 80);
   o.init_min_inliers = vk::param<int>(pnh, "init_min_inliers", 70);
   o.init_min_disparity = vk::param<double>(pnh, "init_min_disparity", 40.0);
+  o.init_min_reference_age = vk::param<double>(pnh, "init_min_reference_age", 0.0);
+  CHECK_GE(o.init_min_reference_age, 0.0);
+  CHECK_LT(o.init_min_reference_age, std::numeric_limits<double>::infinity());
   o.init_min_features_factor = vk::param<double>(pnh, "init_min_features_factor", 2.0);
   o.reproj_error_thresh = vk::param<double>(pnh, "reproj_err_thresh", 2.0);
   o.init_disparity_pivot_ratio = vk::param<double>(pnh, "init_disparity_pivot_ratio", 0.5);

@@ -1,11 +1,13 @@
 #pragma once
 
 #include <mutex>
+#include <cstdint>
 #include <thread>
 #include <unordered_map>
 
 #include <ros/ros.h>
 #include <std_msgs/String.h>    // user-input
+#include <std_msgs/UInt32.h>
 #include <sensor_msgs/Image.h>
 #include <sensor_msgs/Imu.h>
 
@@ -40,6 +42,11 @@ public:
   ros::NodeHandle pnh_;
   PipelineType pipeline_type_;
   ros::Subscriber sub_remote_key_;
+  ros::Publisher pub_remote_key_ack_;
+  ros::Publisher pub_remote_key_status_;
+  ros::Publisher pub_processing_stage_;
+  bool trace_processing_stages_ = false;
+  std::uint32_t remote_key_ack_count_ = 0;
   ros::Publisher pub_pampc_landmarks_;
   std::string remote_input_;
   std::unique_ptr<std::thread> imu_thread_;
@@ -77,6 +84,8 @@ public:
   virtual ~SvoInterface();
 
   // Processing
+  void traceProcessingStage(const char* stage, int64_t timestamp_nanoseconds);
+
   void processImageBundle(
       const std::vector<cv::Mat>& images,
       int64_t timestamp_nanoseconds);

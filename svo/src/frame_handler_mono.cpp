@@ -93,6 +93,7 @@ UpdateResult FrameHandlerMono::processFirstFrame()
   }
 
   // make old frame keyframe
+  VLOG(3) << "Init phase: add reference keyframe";
   initializer_->frames_ref_->setKeyframe();
   initializer_->frames_ref_->at(0)->setKeyframe();
   if(bundle_adjustment_type_==BundleAdjustmentType::kCeres)
@@ -111,22 +112,28 @@ UpdateResult FrameHandlerMono::processFirstFrame()
     map_->addKeyframe(initializer_->frames_ref_->at(0), false);
   }
   // make new frame keyframe
+  VLOG(3) << "Init phase: scene depth";
   newFrame()->setKeyframe();
   frame_utils::getSceneDepth(newFrame(), depth_median_, depth_min_, depth_max_);
   VLOG(40) << "Current Frame Depth: " << "min: " << depth_min_
           << ", max: " << depth_max_ << ", median: " << depth_median_;
+  VLOG(3) << "Init phase: initialize depth seeds";
   depth_filter_->addKeyframe(
               newFrame(), depth_median_, 0.5*depth_min_, depth_median_*1.5);
   VLOG(40) << "Updating seeds in second frame using last frame...";
+  VLOG(3) << "Init phase: update depth seeds";
   depth_filter_->updateSeeds({ newFrame() }, lastFrameUnsafe());
 
   // add frame to map
 
+  VLOG(3) << "Init phase: add current keyframe";
   map_->addKeyframe(newFrame(),
                     bundle_adjustment_type_==BundleAdjustmentType::kCeres);
   stage_ = Stage::kTracking;
   tracking_quality_ = TrackingQuality::kGood;
+  VLOG(3) << "Init phase: reset initializer";
   initializer_->reset();
+  VLOG(3) << "Init phase: complete";
   VLOG(1) << "Init: Selected second frame, triangulated initial map.";
   return UpdateResult::kKeyframe;
 }

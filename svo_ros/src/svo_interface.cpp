@@ -65,6 +65,13 @@ SvoInterface::SvoInterface(
   , automatic_reinitialization_(
       vk::param<bool>(pnh_, "automatic_reinitialization", false))
 {
+  trace_processing_stages_ = vk::param<bool>(pnh_, "trace_processing_stages", false);
+  pub_remote_key_status_ = pnh_.advertise<std_msgs::String>("remote_key_status", 10, true);
+  if (trace_processing_stages_)
+  {
+    pub_processing_stage_ = pnh_.advertise<std_msgs::String>("processing_stage", 10, true);
+    traceProcessingStage("waiting_for_image", 0);
+  }
   switch (pipeline_type)
   {
     case PipelineType::kMono:
@@ -155,6 +162,15 @@ SvoInterface::~SvoInterface()
   if (image_thread_)
     image_thread_->join();
   VLOG(1) << "Destructed SVO.";
+}
+
+void SvoInterface::traceProcessingStage(const char* stage, int64_t timestamp_nanoseconds)
+{
+  if (!trace_processing_stages_)
+    return;
+  std_msgs::String message;
+  message.data = "frame_ns=" + std::to_string(timestamp_nanoseconds) + " stage=" + stage;
+  pub_processing_stage_.publish(message);
 }
 
 void SvoInterface::processImageBundle(
@@ -449,11 +465,17 @@ void processMonoImage(
     const sensor_msgs::ImageConstPtr& depth_msg)
 {
   MonoCallbackTiming timing(msg->header.stamp);
+  const int64_t frame_stamp = msg->header.stamp.toNSec();
+  interface->traceProcessingStage("waiting_for_pipeline_lock", frame_stamp);
   std::lock_guard<std::mutex> pipeline_lock(interface->pipeline_mutex_);
   timing.mark(3);
   if(interface->idle_)
+  {
+    interface->traceProcessingStage("idle", frame_stamp);
     return;
+  }
 
+  interface->traceProcessingStage("copy_image", frame_stamp);
   cv::Mat image;
   try
   {
@@ -462,11 +484,13 @@ void processMonoImage(
   catch (cv_bridge::Exception& e)
   {
     ROS_ERROR("cv_bridge exception: %s", e.what());
+    interface->traceProcessingStage("image_conversion_failed", frame_stamp);
     return;
   }
 
   if(depth_msg)
   {
+    interface->traceProcessingStage("copy_depth", frame_stamp);
     try
     {
       const cv::Mat depth = cv_bridge::toCvCopy(depth_msg, "32FC1")->image;
@@ -474,6 +498,7 @@ void processMonoImage(
       {
         ROS_ERROR("SVO OneShot depth dimensions (%dx%d) do not match RGB (%dx%d)",
                   depth.cols, depth.rows, image.cols, image.rows);
+        interface->traceProcessingStage("depth_dimensions_failed", frame_stamp);
         return;
       }
       interface->svo_->setDepthPriorImage(depth);
@@ -481,6 +506,7 @@ void processMonoImage(
     catch (cv_bridge::Exception& e)
     {
       ROS_ERROR("SVO OneShot depth cv_bridge exception: %s", e.what());
+      interface->traceProcessingStage("depth_conversion_failed", frame_stamp);
       return;
     }
   }
@@ -489,17 +515,22 @@ void processMonoImage(
   images.push_back(image.clone());
   timing.mark(4);
 
+  interface->traceProcessingStage("imu_prior", frame_stamp);
   if(!interface->setImuPrior(msg->header.stamp.toNSec()))
   {
     VLOG(3) << "Could not align gravity! Attempting again in next iteration.";
+    interface->traceProcessingStage("waiting_for_imu_prior", frame_stamp);
     return;
   }
 
   timing.mark(5);
+  interface->traceProcessingStage("preprocess", frame_stamp);
   interface->imageCallbackPreprocessing(msg->header.stamp.toNSec());
   timing.mark(6);
+  interface->traceProcessingStage("process_image_bundle", frame_stamp);
   interface->processImageBundle(images, msg->header.stamp.toNSec());
   timing.mark(7);
+  interface->traceProcessingStage("publish_results", frame_stamp);
   interface->publishResults(images, msg->header.stamp.toNSec());
   timing.mark(8);
 
@@ -507,9 +538,11 @@ void processMonoImage(
      interface->automatic_reinitialization_)
     interface->svo_->start();
 
+  interface->traceProcessingStage("postprocess", frame_stamp);
   interface->imageCallbackPostprocessing();
   timing.mark(9);
   timing.complete(static_cast<int>(interface->svo_->stage()));
+  interface->traceProcessingStage("callback_finished", frame_stamp);
 }
 }  // namespace
 
@@ -573,7 +606,21 @@ void SvoInterface::imuCallback(const sensor_msgs::ImuConstPtr& msg)
 
 void SvoInterface::inputKeyCallback(const std_msgs::StringConstPtr& key_input)
 {
+  if (key_input->data.empty())
+    return;
+  const auto received = std::chrono::steady_clock::now();
+  std_msgs::String status;
+  status.data = "key=" + key_input->data + " phase=received_waiting_for_pipeline_lock";
+  pub_remote_key_status_.publish(status);
+  ROS_INFO_STREAM("SVO remote key: " << status.data);
+  // Receipt is diagnostic only. Keep the real acknowledgement after handling
+  // the command under the image-processing lock.
   std::lock_guard<std::mutex> pipeline_lock(pipeline_mutex_);
+  const double lock_wait_ms = std::chrono::duration<double, std::milli>(
+      std::chrono::steady_clock::now() - received).count();
+  status.data = "key=" + key_input->data + " phase=lock_acquired wait_ms=" + std::to_string(lock_wait_ms);
+  pub_remote_key_status_.publish(status);
+  ROS_INFO_STREAM("SVO remote key: " << status.data);
   std::string remote_input = key_input->data;
   char input = remote_input.c_str()[0];
   switch(input)
@@ -606,6 +653,17 @@ void SvoInterface::inputKeyCallback(const std_msgs::StringConstPtr& key_input)
       break;
     default: ;
   }
+  if (input == 'r' || input == 's')
+  {
+    // Confirm that this SVO process handled the command. A ROS publisher's
+    // connection count can otherwise be satisfied by rosbag alone.
+    std_msgs::UInt32 ack;
+    ack.data = ++remote_key_ack_count_;
+    pub_remote_key_ack_.publish(ack);
+    status.data = "key=" + remote_input + " phase=handled ack=" + std::to_string(ack.data);
+    pub_remote_key_status_.publish(status);
+    ROS_INFO_STREAM("SVO remote key: " << status.data);
+  }
 }
 
 void SvoInterface::subscribeImu()
@@ -629,6 +687,9 @@ void SvoInterface::subscribeRemoteKey()
 {
   std::string remote_key_topic =
       vk::param<std::string>(pnh_, "remote_key_topic", "svo/remote_key");
+  std::string remote_key_ack_topic =
+      vk::param<std::string>(pnh_, "remote_key_ack_topic", "/svo/remote_key_ack");
+  pub_remote_key_ack_ = nh_.advertise<std_msgs::UInt32>(remote_key_ack_topic, 10, false);
   sub_remote_key_ =
       nh_.subscribe(remote_key_topic, 5, &svo::SvoInterface::inputKeyCallback, this);
 }
@@ -669,13 +730,13 @@ void SvoInterface::monoLoop()
   std::unique_ptr<message_filters::Synchronizer<ExactPolicy>> depth_sync;
   if(depth_topic.empty())
   {
-    // Latest waiting mono frame only; preserve the current depth/stereo paths.
-    const int image_queue_size = vk::param<int>(pnh_, "image_queue_size", 1);
+    // Retain a small burst while initialization blocks the image callback.
+    const int image_queue_size = vk::param<int>(pnh_, "image_queue_size", 5);
     if (image_queue_size < 1) {
       ROS_FATAL("image_queue_size must be positive");
       return;
     }
-    ROS_INFO("TX2 mono image subscriber queue: %d", image_queue_size);
+    ROS_INFO("Mono image subscriber queue: %d", image_queue_size);
     it_sub = it.subscribe(image_topic, image_queue_size, &svo::SvoInterface::monoCallback, this);
   }
   else

@@ -302,6 +302,16 @@ InitResult FivePointInit::addFrameBundle(
 
   // Create vector of bearing vectors
   const FrameBundlePtr frames_ref = tracker_->getOldestFrameInTrack(0);
+  const double reference_age = frames_cur->getMinTimestampSeconds() -
+                               frames_ref->getMinTimestampSeconds();
+  if (reference_age < options_.init_min_reference_age)
+  {
+    VLOG(3) << "FivePoint acceptance deferred: reference_age=" << reference_age
+            << " minimum=" << options_.init_min_reference_age
+            << " reference_stamp=" << frames_ref->getMinTimestampNanoseconds()
+            << " current_stamp=" << frames_cur->getMinTimestampNanoseconds();
+    return InitResult::kTracking;
+  }
   FeatureMatches matches_cur_ref;
   feature_tracking_utils::getFeatureMatches(
         *frames_cur->at(0), *frames_ref->at(0), &matches_cur_ref);

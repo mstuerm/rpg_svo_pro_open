@@ -298,9 +298,11 @@ bool FrameHandlerBase::addFrameBundle(const FrameBundlePtr& frame_bundle)
     }
 
     if (options_.trace_statistics) SVO_START_TIMER("map_from_backend");
+    VLOG(3) << "Frame phase: load backend map";
     bundle_adjustment->loadMapFromBundleAdjustment(new_frames_,
                                                    last_frames_, map_,
                                                    have_motion_prior_);
+    VLOG(3) << "Frame phase: backend map loaded";
     if (options_.trace_statistics) SVO_STOP_TIMER("map_from_backend");
 
     if (bundle_adjustment->getNumFrames() > 0 && have_motion_prior_)
@@ -383,7 +385,9 @@ bool FrameHandlerBase::addFrameBundle(const FrameBundlePtr& frame_bundle)
   }
 
   // Perform tracking.
+  VLOG(3) << "Frame phase: process frontend";
   update_res_ = processFrameBundle();
+  VLOG(3) << "Frame phase: frontend complete";
 
   // We start the backend first, since it is the most time crirical
   if (bundle_adjustment_)
@@ -404,7 +408,9 @@ bool FrameHandlerBase::addFrameBundle(const FrameBundlePtr& frame_bundle)
 #endif
     VLOG(40) << "Call bundle adjustment.";
     if (options_.trace_statistics) SVO_START_TIMER("backend_enqueue");
+    VLOG(3) << "Frame phase: enqueue backend";
     bundle_adjustment_->bundleAdjustment(new_frames_);
+    VLOG(3) << "Frame phase: backend enqueued";
     if (options_.trace_statistics) SVO_STOP_TIMER("backend_enqueue");
   }
 

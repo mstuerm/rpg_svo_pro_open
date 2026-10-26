@@ -47,6 +47,10 @@ struct InitializationOptions
   /// is good.
   double init_min_disparity = 50.0;
 
+  /// FivePoint may keep tracking its reference before accepting a second
+  /// frame. Measured using image timestamps; zero preserves normal behavior.
+  double init_min_reference_age = 0.0;
+
   /// When checking whether the disparity of the tracked features are large enough,
   /// we check that a certain percentage of tracked features have disparities large
   /// than init_min_disparity. The default percentage is 0.5, which means the median
