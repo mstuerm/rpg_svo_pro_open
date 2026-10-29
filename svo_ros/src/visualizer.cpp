@@ -241,6 +241,50 @@ void Visualizer::publishSvoInfo(const svo::FrameHandlerBase* const svo,
   msg_info.stage = static_cast<int>(svo->stage());
   msg_info.tracking_quality = static_cast<int>(svo->trackingQuality());
   msg_info.num_matches = svo->lastNumObservations();
+  const std::vector<::svo::LandmarkTraceRecord>& landmark_trace =
+      svo->lastLandmarkTrackingTrace();
+  msg_info.landmark_trace_frame_ids.reserve(landmark_trace.size());
+  msg_info.landmark_trace_point_ids.reserve(landmark_trace.size());
+  msg_info.landmark_trace_reference_frame_ids.reserve(landmark_trace.size());
+  msg_info.landmark_trace_reference_feature_indices.reserve(landmark_trace.size());
+  msg_info.landmark_trace_outcomes.reserve(landmark_trace.size());
+  msg_info.landmark_trace_match_results.reserve(landmark_trace.size());
+  msg_info.landmark_trace_succeeded_reprojections.reserve(landmark_trace.size());
+  msg_info.landmark_trace_failed_reprojections.reserve(landmark_trace.size());
+  msg_info.landmark_trace_projected_x.reserve(landmark_trace.size());
+  msg_info.landmark_trace_projected_y.reserve(landmark_trace.size());
+  msg_info.landmark_trace_matched_x.reserve(landmark_trace.size());
+  msg_info.landmark_trace_matched_y.reserve(landmark_trace.size());
+  msg_info.landmark_trace_match_displacement_px.reserve(landmark_trace.size());
+  msg_info.landmark_trace_reprojection_error_px.reserve(landmark_trace.size());
+  msg_info.landmark_trace_point_world_x.reserve(landmark_trace.size());
+  msg_info.landmark_trace_point_world_y.reserve(landmark_trace.size());
+  msg_info.landmark_trace_point_world_z.reserve(landmark_trace.size());
+  for (const ::svo::LandmarkTraceRecord& trace : landmark_trace)
+  {
+    msg_info.landmark_trace_frame_ids.push_back(trace.frame_id);
+    msg_info.landmark_trace_point_ids.push_back(trace.point_id);
+    msg_info.landmark_trace_reference_frame_ids.push_back(trace.reference_frame_id);
+    msg_info.landmark_trace_reference_feature_indices.push_back(
+        trace.reference_feature_index);
+    msg_info.landmark_trace_outcomes.push_back(trace.outcome);
+    msg_info.landmark_trace_match_results.push_back(trace.match_result);
+    msg_info.landmark_trace_succeeded_reprojections.push_back(
+        trace.succeeded_reprojections);
+    msg_info.landmark_trace_failed_reprojections.push_back(
+        trace.failed_reprojections);
+    msg_info.landmark_trace_projected_x.push_back(trace.projected_x);
+    msg_info.landmark_trace_projected_y.push_back(trace.projected_y);
+    msg_info.landmark_trace_matched_x.push_back(trace.matched_x);
+    msg_info.landmark_trace_matched_y.push_back(trace.matched_y);
+    msg_info.landmark_trace_match_displacement_px.push_back(
+        trace.match_displacement_px);
+    msg_info.landmark_trace_reprojection_error_px.push_back(
+        trace.reprojection_error_px);
+    msg_info.landmark_trace_point_world_x.push_back(trace.point_world_x);
+    msg_info.landmark_trace_point_world_y.push_back(trace.point_world_y);
+    msg_info.landmark_trace_point_world_z.push_back(trace.point_world_z);
+  }
   pub_info_.publish(msg_info);
 }
 

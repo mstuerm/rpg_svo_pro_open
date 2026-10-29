@@ -177,6 +177,7 @@ void SvoInterface::processImageBundle(
     const std::vector<cv::Mat>& images,
     const int64_t timestamp_nanoseconds)
 {
+  const bool first_initialization_image = !svo_->hasStarted();
   if (!svo_->isBackendValid())
   {
     if (vk::param<bool>(pnh_, "use_ceres_backend", false, true))
@@ -196,6 +197,18 @@ void SvoInterface::processImageBundle(
     }
   }
   svo_->addImageBundle(images, timestamp_nanoseconds);
+  if (first_initialization_image && svo_->getLastFrames())
+  {
+    const auto frames = svo_->getLastFrames();
+    const auto pose = frames->get_T_W_B();
+    const auto& q = pose.getRotation().toImplementation();
+    ROS_INFO_STREAM("SVO_INIT_FRAME phase=first_reference image_ns="
+        << timestamp_nanoseconds << " bundle=" << frames->getBundleId()
+        << " backend_valid=" << svo_->isBackendValid()
+        << " p_wi=[" << pose.getPosition().transpose()
+        << "] q_wi_wxyz=[" << q.w() << ' ' << q.x() << ' '
+        << q.y() << ' ' << q.z() << ']');
+  }
 }
 
 void SvoInterface::publishResults(
@@ -639,9 +652,15 @@ void SvoInterface::inputKeyCallback(const std_msgs::StringConstPtr& key_input)
       SVO_INFO_STREAM("SVO user input: RESET");
       break;
     case 's':
+      // Retire the old map/backend before the next image selects its reference.
+      // processImageBundle will create the fresh backend BEFORE addFrameBundle,
+      // allowing its gravity prior to set the very first reference pose.
+      svo_->resetForInitialization();
+      ceres_backend_interface_.reset();
       svo_->start();
+      pampc_landmark_persistence_.clear();
       idle_ = false;
-      SVO_INFO_STREAM("SVO user input: START");
+      SVO_INFO_STREAM("SVO user input: START (old frontend/backend cleared before first reference)");
       break;
      case 'c':
       svo_->setCompensation(true);

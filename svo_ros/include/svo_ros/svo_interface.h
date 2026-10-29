@@ -15,6 +15,7 @@
 #include <svo/common/types.h>
 #include <svo/common/camera_fwd.h>
 #include <svo/common/transformation.h>
+#include <svo/common/imu_calibration.h>
 
 namespace svo {
 
@@ -69,6 +70,13 @@ public:
   bool quit_ = false;
   bool idle_ = false;
   bool automatic_reinitialization_ = false;
+  // Explicit post-START measurements used only for initial gravity, not IMU
+  // propagation. Accessed under pipeline_mutex_; ImuHandler owns its own lock.
+  double gravity_initialization_duration_ = 0.0;
+  double gravity_initialization_start_ = 0.0;
+  bool gravity_initialization_pending_ = false;
+  ImuMeasurements gravity_initialization_measurements_;
+  ros::Publisher pub_gravity_initialization_;
   // Remote reset/start commands arrive on ROS's callback thread while images
   // are processed on image_thread_. Resetting the Ceres backend concurrently
   // with addFrameBundle() invalidates backend state underneath the optimizer.
@@ -91,6 +99,8 @@ public:
       int64_t timestamp_nanoseconds);
 
   bool setImuPrior(const int64_t timestamp_nanoseconds);
+  void ensureBackend();
+  bool collectInitialGravity(const int64_t timestamp_nanoseconds);
 
   void publishResults(
       const std::vector<cv::Mat>& images,

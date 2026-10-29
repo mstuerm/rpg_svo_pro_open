@@ -34,6 +34,7 @@ void Reprojector::reprojectFrames(
       (options_.use_kfs_from_global_map? options_.max_fixed_landmarks : 0u);
   const size_t max_total_n_features =
       options_.max_n_features_per_frame + max_n_fixed_lm;
+  landmark_trace_.clear();
   CHECK_GT(options_.max_n_features_per_frame, 0u);
   cur_frame->resizeFeatureStorage(max_total_n_features);
 
@@ -150,6 +151,15 @@ void Reprojector::reprojectFrames(
       // first check if the point is valid.
       if(point->n_failed_reproj_ > 10)
       {
+        LandmarkTraceRecord trace;
+        trace.frame_id = cur_frame->id_;
+        trace.point_id = point->id();
+        trace.reference_frame_id = ref_frame->id_;
+        trace.reference_feature_index = static_cast<int>(i);
+        trace.outcome = static_cast<uint8_t>(LandmarkTraceOutcome::kFailureLimit);
+        trace.succeeded_reprojections = point->n_succeeded_reproj_;
+        trace.failed_reprojections = point->n_failed_reproj_;
+        landmark_trace_.push_back(trace);
         trash_points.push_back(point);
         continue;
       }
@@ -164,6 +174,15 @@ void Reprojector::reprojectFrames(
       // initialized some 3d points from the ground-truth.
       if(point->obs_.size() < 2 && options_.remove_unconstrained_points)
       {
+        LandmarkTraceRecord trace;
+        trace.frame_id = cur_frame->id_;
+        trace.point_id = point->id();
+        trace.reference_frame_id = ref_frame->id_;
+        trace.reference_feature_index = static_cast<int>(i);
+        trace.outcome = static_cast<uint8_t>(LandmarkTraceOutcome::kInsufficientObservations);
+        trace.succeeded_reprojections = point->n_succeeded_reproj_;
+        trace.failed_reprojections = point->n_failed_reproj_;
+        landmark_trace_.push_back(trace);
         trash_points.push_back(point);
         continue;
       }
@@ -172,6 +191,18 @@ void Reprojector::reprojectFrames(
       Candidate candidate;
       if(reprojector_utils::getCandidate(cur_frame, ref_frame, i, candidate))
         candidates_.push_back(candidate);
+      else
+      {
+        LandmarkTraceRecord trace;
+        trace.frame_id = cur_frame->id_;
+        trace.point_id = point->id();
+        trace.reference_frame_id = ref_frame->id_;
+        trace.reference_feature_index = static_cast<int>(i);
+        trace.outcome = static_cast<uint8_t>(LandmarkTraceOutcome::kNotVisible);
+        trace.succeeded_reprojections = point->n_succeeded_reproj_;
+        trace.failed_reprojections = point->n_failed_reproj_;
+        landmark_trace_.push_back(trace);
+      }
     }
   }
 
@@ -181,7 +212,8 @@ void Reprojector::reprojectFrames(
   reprojector_utils::matchCandidates(
         cur_frame, max_total_n_features,
         options_.affine_est_offset, options_.affine_est_gain,
-        candidates_, *grid_, lm_stats, options_.seed_sigma2_thresh);
+        candidates_, *grid_, lm_stats, options_.seed_sigma2_thresh,
+        &landmark_trace_);
   VLOG(10) << "After projection: remaining landmark candidates num: "
            << candidates_.size() << std::endl;
   VLOG(5) << "Reproject landmarks in cam-" << camera_index_
@@ -347,7 +379,8 @@ void matchCandidates(
     Reprojector::Candidates& candidates,
     OccupandyGrid2D& grid,
     Reprojector::Statistics& stats,
-    const double seed_sigma2_thresh)
+    const double seed_sigma2_thresh,
+    std::vector<LandmarkTraceRecord>* landmark_trace)
 {
   Matcher matcher;
   matcher.options_.affine_est_offset_ = affine_est_offset;
@@ -356,26 +389,108 @@ void matchCandidates(
   for(Reprojector::Candidate& candidate : candidates)
   {
     ++i;
+    const PointPtr point = candidate.ref_frame->landmark_vec_[candidate.ref_index];
+    LandmarkTraceRecord trace;
+    const bool trace_point = landmark_trace != nullptr && point != nullptr;
+    if (trace_point)
+    {
+      trace.frame_id = frame->id_;
+      trace.point_id = point->id();
+      trace.reference_frame_id = candidate.ref_frame->id_;
+      trace.reference_feature_index = static_cast<int>(candidate.ref_index);
+      trace.projected_x = static_cast<float>(candidate.cur_px.x());
+      trace.projected_y = static_cast<float>(candidate.cur_px.y());
+      trace.point_world_x = static_cast<float>(point->pos().x());
+      trace.point_world_y = static_cast<float>(point->pos().y());
+      trace.point_world_z = static_cast<float>(point->pos().z());
+    }
     size_t grid_index =
         grid.getCellIndex(candidate.cur_px.x(),candidate.cur_px.y(), 1);
     if(max_n_features_per_frame > 0 && grid.isOccupied(grid_index))
     {
+      if (trace_point)
+      {
+        trace.outcome = static_cast<uint8_t>(LandmarkTraceOutcome::kGridOccupied);
+        trace.succeeded_reprojections = point->n_succeeded_reproj_;
+        trace.failed_reprojections = point->n_failed_reproj_;
+        landmark_trace->push_back(trace);
+      }
       continue;
     }
 
     ++stats.n_trials;
     FeatureWrapper feature_wrapper = frame->getEmptyFeatureWrapper();
+    int16_t match_result = -1;
+    Keypoint matched_px = candidate.cur_px;
     if(matchCandidate(frame, candidate, matcher, feature_wrapper,
-                      seed_sigma2_thresh))
+                      seed_sigma2_thresh,
+                      trace_point ? &match_result : nullptr,
+                      trace_point ? &matched_px : nullptr))
     {
       ++stats.n_matches;
       ++frame->num_features_;
       grid.setOccupied(grid_index);
+      if (trace_point)
+      {
+        trace.outcome = static_cast<uint8_t>(LandmarkTraceOutcome::kMatched);
+        trace.match_result = match_result;
+        trace.matched_x = static_cast<float>(matched_px.x());
+        trace.matched_y = static_cast<float>(matched_px.y());
+        trace.match_displacement_px = static_cast<float>((matched_px - Eigen::Vector2d(
+            trace.projected_x, trace.projected_y)).norm());
+        trace.succeeded_reprojections = point->n_succeeded_reproj_;
+        trace.failed_reprojections = point->n_failed_reproj_;
+        landmark_trace->push_back(trace);
+      }
       if(max_n_features_per_frame > 0
          && frame->num_features_ >= max_n_features_per_frame)
       {
+        if (landmark_trace != nullptr)
+        {
+          // The current candidate was logged above. Remaining candidates were
+          // not tested because the frame reached its feature budget.
+          for (size_t j = static_cast<size_t>(i); j < candidates.size(); ++j)
+          {
+            const Reprojector::Candidate& skipped = candidates[j];
+            const PointPtr skipped_point =
+                skipped.ref_frame->landmark_vec_[skipped.ref_index];
+            if (!skipped_point) continue;
+            LandmarkTraceRecord skipped_trace;
+            skipped_trace.frame_id = frame->id_;
+            skipped_trace.point_id = skipped_point->id();
+            skipped_trace.reference_frame_id = skipped.ref_frame->id_;
+            skipped_trace.reference_feature_index =
+                static_cast<int>(skipped.ref_index);
+            skipped_trace.point_world_x = static_cast<float>(skipped_point->pos().x());
+            skipped_trace.point_world_y = static_cast<float>(skipped_point->pos().y());
+            skipped_trace.point_world_z = static_cast<float>(skipped_point->pos().z());
+            skipped_trace.outcome = static_cast<uint8_t>(
+                LandmarkTraceOutcome::kFeatureLimit);
+            skipped_trace.succeeded_reprojections =
+                skipped_point->n_succeeded_reproj_;
+            skipped_trace.failed_reprojections =
+                skipped_point->n_failed_reproj_;
+            skipped_trace.projected_x = static_cast<float>(skipped.cur_px.x());
+            skipped_trace.projected_y = static_cast<float>(skipped.cur_px.y());
+            landmark_trace->push_back(skipped_trace);
+          }
+        }
         break;
       }
+    }
+    else if (trace_point)
+    {
+      trace.outcome = match_result == 8
+          ? static_cast<uint8_t>(LandmarkTraceOutcome::kNoCloseView)
+          : static_cast<uint8_t>(LandmarkTraceOutcome::kMatchFailed);
+      trace.match_result = match_result;
+      trace.matched_x = static_cast<float>(matched_px.x());
+      trace.matched_y = static_cast<float>(matched_px.y());
+      trace.match_displacement_px = static_cast<float>((matched_px - Eigen::Vector2d(
+          trace.projected_x, trace.projected_y)).norm());
+      trace.succeeded_reprojections = point->n_succeeded_reproj_;
+      trace.failed_reprojections = point->n_failed_reproj_;
+      landmark_trace->push_back(trace);
     }
   }
   candidates.erase(candidates.begin(), candidates.begin()+i);
@@ -386,8 +501,11 @@ bool matchCandidate(
     Reprojector::Candidate& c,
     Matcher& matcher,
     FeatureWrapper& feature,
-    const double seed_sigma2_thresh)
+    const double seed_sigma2_thresh,
+    int16_t* match_result,
+    Keypoint* matched_px)
 {
+  if (match_result) *match_result = -1;
   GradientVector grad_ref;
 
   // direct matching
@@ -403,6 +521,8 @@ bool matchCandidate(
       Matcher::MatchResult res =
           matcher.findMatchDirect(*c.ref_frame, *frame, ref_ftr, ref_depth,
                                   c.cur_px);
+      if (match_result) *match_result = static_cast<int16_t>(res);
+      if (matched_px) *matched_px = c.cur_px;
       if(res != Matcher::MatchResult::kSuccess)
         return false;
     }
@@ -433,6 +553,8 @@ bool matchCandidate(
     size_t ref_feature_index;
     if(!point->getCloseViewObs(frame->pos(), ref_frame, ref_feature_index))
     {
+      if (match_result) *match_result = 8;  // Matcher::kFailCloseView.
+      if (matched_px) *matched_px = c.cur_px;
       return false;
     }
     FeatureWrapper ref_ftr = ref_frame->getFeatureWrapper(ref_feature_index);
@@ -440,6 +562,8 @@ bool matchCandidate(
     const FloatType ref_depth = (ref_frame->pos() - ref_ftr.landmark->pos()).norm();
     Matcher::MatchResult res = matcher.findMatchDirect(
           *ref_frame, *frame, ref_ftr, ref_depth, c.cur_px);
+    if (match_result) *match_result = static_cast<int16_t>(res);
+    if (matched_px) *matched_px = c.cur_px;
     if(res != Matcher::MatchResult::kSuccess)
     {
       point->n_failed_reproj_++;

@@ -6,6 +6,10 @@
 #include <svo/imu_handler.h>
 #include <svo/global.h>
 #include <fstream>
+#include <chrono>
+#include <iomanip>
+#include <set>
+#include <sstream>
 
 #include "svo/motion_detector.hpp"
 #include "svo/outlier_rejection.hpp"
@@ -75,6 +79,71 @@ CeresBackendInterface::~CeresBackendInterface()
   }
 }
 
+// Called under mutex_backend_. Inspect state only; do not repair or filter it.
+void CeresBackendInterface::traceHandoff(
+    const char* phase, const FrameBundlePtr& current,
+    const FrameBundlePtr& previous, const Map::Ptr& map) const
+{
+  std::ostringstream out;
+  out << std::setprecision(9) << "SVO_HANDOFF phase=" << phase
+      << " image_ns=" << (current ? current->getMinTimestampNanoseconds() : 0)
+      << " bundle=" << (current ? current->getBundleId() : -1)
+      << " imu_bundle=" << last_added_nframe_imu_
+      << " visual_bundle=" << last_added_nframe_images_
+      << " optimized_bundle=" << last_optimized_nframe_.load()
+      << " applied_bundle=" << last_updated_nframe_
+      << " backend_frames=" << backend_.numFrames()
+      << " active_kfs=[";
+  for (const auto& frame : active_keyframes_)
+    if (frame) out << frame->id() << ':' << frame->bundleId() << ',';
+  out << ']';
+  const auto describe_frame = [&out](const char* role, const FramePtr& frame) {
+    if (!frame) { out << ' ' << role << "=null"; return; }
+    const auto pose = frame->T_world_imu();
+    const auto& q = pose.getRotation().toImplementation();
+    out << ' ' << role << "={id:" << frame->id()
+        << ",bundle:" << frame->bundleId() << ",kf:" << frame->isKeyframe()
+        << ",features:" << frame->numFeatures()
+        << ",landmarks:" << frame->numLandmarks()
+        << ",in_ba:" << frame->numLandmarksInBA()
+        << ",p_wi:[" << pose.getPosition().transpose()
+        << "],q_wi_wxyz:[" << q.w() << ' ' << q.x() << ' ' << q.y()
+        << ' ' << q.z() << "]}";
+  };
+  if (current)
+    for (const auto& frame : *current) describe_frame("current", frame);
+  if (previous)
+    for (const auto& frame : *previous) describe_frame("previous", frame);
+  std::set<int> points;
+  size_t finite = 0, visible = 0, samples = 0;
+  if (map)
+  {
+    out << " map_kfs=" << map->size();
+    for (const auto& entry : map->keyframes_)
+    {
+      describe_frame("map_kf", entry.second);
+      if (!entry.second) continue;
+      for (const auto& point : entry.second->landmark_vec_)
+      {
+        if (!point || !points.insert(point->id()).second) continue;
+        if (point->pos_.allFinite())
+        {
+          ++finite;
+          if (current && !current->empty() && current->at(0)->isVisible(point->pos_))
+            ++visible;
+        }
+        if (samples++ < 3)
+          out << " point={id:" << point->id() << ",p_w:["
+              << point->pos_.transpose() << "]}";
+      }
+    }
+    out << " unique_map_landmarks=" << points.size()
+        << " finite_map_landmarks=" << finite
+        << " geometrically_visible_in_current=" << visible;
+  }
+  LOG(INFO) << out.str();
+}
+
 // Get a motion prior for new_frames and update the frontend map and last_frames
 // (note that map is not used, but actually all keyframes in map are updated
 //  in call to updateActiveKeyframes() )
@@ -88,6 +157,14 @@ void CeresBackendInterface::loadMapFromBundleAdjustment(
   }
 
   std::lock_guard<std::mutex> lock(mutex_backend_);
+
+  const bool trace = options_.trace_handoff && map && map->size() > 0 &&
+      handoff_trace_frames_ < options_.trace_handoff_frames;
+  if (trace)
+  {
+    ++handoff_trace_frames_;
+    traceHandoff("before_imu_prior", new_frames, last_frames, map);
+  }
 
   // Setup motion detector ----------------------------------------------------
   if (motion_detector_)
@@ -119,9 +196,12 @@ void CeresBackendInterface::loadMapFromBundleAdjustment(
         (imu_status == IMUTemporalStatus::kStationary);
   }
 
+  if (trace) traceHandoff("after_imu_prior", new_frames, last_frames, map);
+
   // Update Frames and Map ---------------------------------------------------
   if (last_updated_nframe_ == last_optimized_nframe_.load())
   {
+    if (trace) traceHandoff("no_optimized_update", new_frames, last_frames, map);
     VLOG(3) << "VIN: No map update available.";
     return;
   }
@@ -143,11 +223,13 @@ void CeresBackendInterface::loadMapFromBundleAdjustment(
       updateFrameStateWithBackend(keyframe, false);
       n_frames_updated++;
     }
+    if (trace) traceHandoff("after_keyframe_poses", new_frames, last_frames, map);
     VLOG(3) << "Updated " << n_frames_updated << " frames in map.";
 
     // Update the 3d points in map of the updated keyframes ----------------
     // Statistics
     backend_.updateAllActivePoints();
+    if (trace) traceHandoff("after_landmark_positions", new_frames, last_frames, map);
   }
 
   // Update last frame bundle ------------------------------------------------
@@ -160,6 +242,8 @@ void CeresBackendInterface::loadMapFromBundleAdjustment(
         updateFrameStateWithBackend(last_frame, true);
       }
     }
+
+    if (trace) traceHandoff("before_outlier_rejection", new_frames, last_frames, map);
 
     // Remove outliers of last_frames ----------------------------------------
     if (outlier_rejection_)
@@ -177,10 +261,19 @@ void CeresBackendInterface::loadMapFromBundleAdjustment(
         }
         //! @todo should we only remove observation but leave points?
         backend_.removePointsByPointIds(deleted_points);
+        if (trace)
+          LOG(INFO) << "SVO_HANDOFF phase=outlier_rejection image_ns="
+                    << new_frames->getMinTimestampNanoseconds()
+                    << " bundle=" << new_frames->getBundleId()
+                    << " removed_edges=" << n_deleted_edges
+                    << " removed_corners=" << n_deleted_corners
+                    << " removed_point_ids=" << deleted_points.size();
         VLOG(6) << "Outlier rejection: removed " << n_deleted_edges
                 << " edgelets and " << n_deleted_corners << " corners.";
       }
     }
+
+    if (trace) traceHandoff("after_outlier_rejection", new_frames, last_frames, map);
 
     // The following is not used for the algorithm to work, but updated for
     // completeness.
@@ -224,6 +317,10 @@ void CeresBackendInterface::bundleAdjustment(const FrameBundlePtr& frame_bundle)
    */
 
   std::lock_guard<std::mutex> lock(mutex_backend_);
+
+  if (options_.trace_handoff && frame_bundle->isKeyframe() &&
+      handoff_trace_frames_ < options_.trace_handoff_frames)
+    traceHandoff("before_visual_enqueue", frame_bundle, FrameBundlePtr(), Map::Ptr());
 
   vk::Timer timer;
   timer.start();
@@ -333,6 +430,9 @@ void CeresBackendInterface::bundleAdjustment(const FrameBundlePtr& frame_bundle)
 
   last_added_nframe_images_ = frame_bundle->getBundleId();
   last_added_frame_stamp_ns_ = frame_bundle->getMinTimestampNanoseconds();
+  if (options_.trace_handoff && frame_bundle->isKeyframe() &&
+      handoff_trace_frames_ < options_.trace_handoff_frames)
+    traceHandoff("after_visual_enqueue", frame_bundle, FrameBundlePtr(), Map::Ptr());
   if (g_permon_backend_)
   {
     g_permon_backend_->log("pre_optim_time", timer.stop());
@@ -483,6 +583,15 @@ void CeresBackendInterface::addLandmarksAndObservationsToBackend(
 }
 
 // Introduce a state for the frame_bundle in backend. Add IMU terms.
+void CeresBackendInterface::setInitialGravityMeasurements(
+    const ImuMeasurements& measurements)
+{
+  std::lock_guard<std::mutex> lock(mutex_backend_);
+  CHECK_EQ(backend_.numFrames(), 0u);
+  CHECK_GE(measurements.size(), 2u);
+  initial_gravity_measurements_ = measurements;
+}
+
 bool CeresBackendInterface::addStatesAndInertialMeasurementsToBackend(
     const FrameBundlePtr& frame_bundle)
 {
@@ -509,11 +618,30 @@ bool CeresBackendInterface::addStatesAndInertialMeasurementsToBackend(
   }
 
   // introduce a state for the frame in the backend --------------------------
-  if (!backend_.addStates(frame_bundle, imu_measurements,
+  // addStates initializes gravity (without propagation) for its first state.
+  // Avoid averaging pre-START history for that one operation. Still retrieve
+  // the ordinary edge-bracketed measurements above to preserve subsequent
+  // propagation endpoints and normal buffer bookkeeping.
+  const bool fresh_gravity = backend_.numFrames() == 0 &&
+      !initial_gravity_measurements_.empty();
+  const ImuMeasurements& state_measurements = fresh_gravity
+      ? initial_gravity_measurements_ : imu_measurements;
+  if (!backend_.addStates(frame_bundle, state_measurements,
                           current_frame_bundle_stamp))
   {
     LOG(ERROR) << "Failed to add state. Will drop frames.";
     return false;
+  }
+
+  if (fresh_gravity)
+  {
+    LOG(INFO) << "SVO_INIT_GRAVITY phase=backend_consumed count="
+              << initial_gravity_measurements_.size()
+              << " first_imu=" << std::setprecision(17)
+              << initial_gravity_measurements_.back().timestamp_
+              << " last_imu=" << initial_gravity_measurements_.front().timestamp_
+              << " image=" << current_frame_bundle_stamp;
+    initial_gravity_measurements_.clear();
   }
 
   VLOG(10) << "Backend: Added " << imu_measurements.size() << " inertial "
@@ -600,6 +728,9 @@ void CeresBackendInterface::quitThread()
 // Performance monitor for benchmarking
 void CeresBackendInterface::setPerformanceMonitor(const std::string& trace_dir)
 {
+  // Paused callbacks can revisit this method; resets construct a new backend.
+  // Neither case may truncate the previous initialization's evidence.
+  if (g_permon_backend_) return;
   // Initialize Performance Monitor
   g_permon_backend_.reset(new vk::PerformanceMonitor());
   g_permon_backend_->addLog("tot_time");
@@ -608,11 +739,17 @@ void CeresBackendInterface::setPerformanceMonitor(const std::string& trace_dir)
   g_permon_backend_->addLog("marginalization");
   g_permon_backend_->addLog("fixation");
   g_permon_backend_->addLog("n_fixed_lm");
+  g_permon_backend_->addLog("bundle_id");
+  g_permon_backend_->addLog("image_stamp_ns");
   for (const auto k : MarginalizationTiming::names_)
   {
     g_permon_backend_->addLog(k);
   }
-  g_permon_backend_->init("trace_backend", trace_dir);
+  std::string trace_name = "trace_backend";
+  if (std::ifstream(trace_dir + "/trace_backend.csv").good())
+    trace_name += "_" + std::to_string(
+        std::chrono::steady_clock::now().time_since_epoch().count());
+  g_permon_backend_->init(trace_name, trace_dir);
 }
 
 void CeresBackendInterface::optimizationLoop()
@@ -714,6 +851,8 @@ void CeresBackendInterface::optimizationStep()
   last_optimized_nframe_.store(last_added_nframe_images_);
   if (g_permon_backend_)
   {
+    g_permon_backend_->log("bundle_id", last_optimized_nframe_.load());
+    g_permon_backend_->log("image_stamp_ns", last_added_frame_stamp_ns_);
     g_permon_backend_->log(
         "tot_time", timers_[last_optimized_nframe_.load()].stop());
     g_permon_backend_->writeToFile();

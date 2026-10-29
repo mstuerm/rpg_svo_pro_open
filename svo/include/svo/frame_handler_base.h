@@ -23,6 +23,7 @@
 #include "svo/common/frame.h"
 #include "svo/map.h"
 #include "svo/global.h"
+#include "svo/reprojector.h"
 
 // forward declarations:
 namespace vk
@@ -277,6 +278,10 @@ public:
   /// Will reset the map as soon as the current frame is finished processing.
   void reset() { set_reset_ = true; }
 
+  /// Clear frontend and detach the backend before a new initialization image.
+  /// The caller must exclude image processing, then call start().
+  void resetForInitialization();
+
   /// Get the current stage of the algorithm.
   inline Stage stage() const { return stage_; }
   inline std::string stageStr() const { return kStageName.at(stage_); }
@@ -348,6 +353,8 @@ public:
 
   /// Get the number of feature observations of the last frame.
   inline size_t lastNumObservations() const { return num_obs_last_; }
+  inline const std::vector<LandmarkTraceRecord>& lastLandmarkTrackingTrace() const
+  { return last_landmark_tracking_trace_; }
 
   /// EXPERIMENTAL Set Bundle-Adjuster handler
   void setBundleAdjuster(const AbstractBundleAdjustmentPtr& ba);
@@ -411,6 +418,7 @@ public:
   // SVO Modules
   SparseImgAlignBasePtr sparse_img_align_;
   std::vector<ReprojectorPtr> reprojectors_;
+  std::vector<LandmarkTraceRecord> last_landmark_tracking_trace_;
   PoseOptimizerPtr pose_optimizer_;
   DepthFilterPtr depth_filter_;
   InitializerPtr initializer_;

@@ -692,6 +692,7 @@ size_t FrameHandlerBase::sparseImageAlignment()
 size_t FrameHandlerBase::projectMapInFrame()
 {
   VLOG(40) << "Project map in frame.";
+  last_landmark_tracking_trace_.clear();
   if (options_.trace_statistics)
   {
     SVO_START_TIMER("reproject");
@@ -747,6 +748,13 @@ size_t FrameHandlerBase::projectMapInFrame()
             new_frames_->at(camera_idx), overlap_kfs_.at(camera_idx),
             trash_points.at(camera_idx));
     }
+  }
+
+  for (const ReprojectorPtr& reprojector : reprojectors_)
+  {
+    last_landmark_tracking_trace_.insert(
+        last_landmark_tracking_trace_.end(),
+        reprojector->landmark_trace_.begin(), reprojector->landmark_trace_.end());
   }
 
   // Effectively clear the points that were discarded by the reprojectors
@@ -808,6 +816,33 @@ size_t FrameHandlerBase::optimizePose()
                                       options_.poseoptim_prior_lambda);
   }
   size_t sfba_n_edges_final = pose_optimizer_->run(new_frames_, options_.poseoptim_thresh);
+
+  // Distinguish a successful direct match from a later pose-optimization
+  // outlier. The optimizer clears the landmark pointer but preserves track_id.
+  for (LandmarkTraceRecord& trace : last_landmark_tracking_trace_)
+  {
+    if (trace.outcome != static_cast<uint8_t>(LandmarkTraceOutcome::kMatched))
+      continue;
+    for (const FramePtr& frame : new_frames_->frames_)
+    {
+      if (frame->id_ != trace.frame_id) continue;
+      for (size_t i = 0; i < frame->num_features_; ++i)
+      {
+        if (frame->track_id_vec_[i] != trace.point_id) continue;
+        const Position point_world(trace.point_world_x, trace.point_world_y,
+                                   trace.point_world_z);
+        const Position point_camera = frame->T_world_cam().inverse() * point_world;
+        Keypoint projected_px;
+        if (frame->cam()->project3(point_camera, &projected_px).isKeypointVisible())
+          trace.reprojection_error_px = static_cast<float>(
+              (frame->px_vec_.col(i) - projected_px).norm());
+        if (frame->type_vec_[i] == FeatureType::kOutlier)
+          trace.outcome = static_cast<uint8_t>(LandmarkTraceOutcome::kPoseOutlier);
+        break;
+      }
+      break;
+    }
+  }
 
   if (options_.trace_statistics)
   {
@@ -964,6 +999,12 @@ void FrameHandlerBase::upgradeSeedsToFeatures(const FramePtr& frame)
 }
 
 //------------------------------------------------------------------------------
+void FrameHandlerBase::resetForInitialization()
+{
+  resetAll();
+  resetBackend();
+}
+
 void FrameHandlerBase::resetVisionFrontendCommon()
 {
   stage_ = Stage::kPaused;

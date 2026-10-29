@@ -8,6 +8,9 @@
 
 #pragma once
 
+#include <cstdint>
+#include <vector>
+
 #include <svo/common/types.h>
 #include<svo/common/frame.h>
 #include <svo/common/feature_wrapper.h>
@@ -17,6 +20,40 @@ class AbstractCamera;
 }
 
 namespace svo {
+
+// Per-frame diagnostic for a persistent map point considered by the
+// reprojector. Numeric values are exported in svo_msgs/Info for bag capture.
+enum class LandmarkTraceOutcome : uint8_t {
+  kMatched = 0,
+  kMatchFailed = 1,
+  kNotVisible = 2,
+  kFailureLimit = 3,
+  kInsufficientObservations = 4,
+  kGridOccupied = 5,
+  kFeatureLimit = 6,
+  kNoCloseView = 7,
+  kPoseOutlier = 8
+};
+
+struct LandmarkTraceRecord {
+  int frame_id = -1;
+  int point_id = -1;
+  int reference_frame_id = -1;
+  int reference_feature_index = -1;
+  uint8_t outcome = static_cast<uint8_t>(LandmarkTraceOutcome::kMatchFailed);
+  int16_t match_result = -1;  // Matcher::MatchResult, or -1 if not attempted.
+  int succeeded_reprojections = 0;
+  int failed_reprojections = 0;
+  float projected_x = -1.0f;
+  float projected_y = -1.0f;
+  float matched_x = -1.0f;
+  float matched_y = -1.0f;
+  float match_displacement_px = -1.0f;
+  float reprojection_error_px = -1.0f;
+  float point_world_x = 0.0f;
+  float point_world_y = 0.0f;
+  float point_world_z = 0.0f;
+};
 
 class Matcher;
 class OccupandyGrid2D;
@@ -112,6 +149,7 @@ public:
   };
   Statistics stats_;
   Statistics fixed_lm_stats_;
+  std::vector<LandmarkTraceRecord> landmark_trace_;
 
   /// A candidate is a point that projects into the image plane and for which we
   /// will search a maching feature in the image.
@@ -177,14 +215,17 @@ namespace reprojector_utils {
       Reprojector::Candidates& candidates,
       OccupandyGrid2D& grid,
       Reprojector::Statistics& stats,
-      const double seed_sigma2_thresh=200);
+      const double seed_sigma2_thresh=200,
+      std::vector<LandmarkTraceRecord>* landmark_trace = nullptr);
 
   bool matchCandidate(
       const FramePtr& frame,
       Reprojector::Candidate& c,
       Matcher& matcher,
       FeatureWrapper& feature,
-      const double seed_sigma2_thresh=200);
+      const double seed_sigma2_thresh=200,
+      int16_t* match_result = nullptr,
+      Keypoint* matched_px = nullptr);
 
   bool getCandidate(
       const FramePtr& cur_frame,

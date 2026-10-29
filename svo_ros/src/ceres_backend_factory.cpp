@@ -65,6 +65,11 @@ CeresBackendInterface::Ptr makeBackend(const ros::NodeHandle& pnh,
       (vk::param<int>(pnh, "ceres_max_fixed_landmarks", 50u));
 
   CeresBackendInterfaceOptions ba_interface_options;
+  ba_interface_options.trace_handoff =
+      vk::param<bool>(pnh, "backend_trace_handoff", false);
+  const int handoff_frames = vk::param<int>(pnh, "backend_trace_handoff_frames", 20);
+  CHECK_GT(handoff_frames, 0);
+  ba_interface_options.trace_handoff_frames = static_cast<size_t>(handoff_frames);
   ba_interface_options.rotate_world_velocity_for_frame_state =
       vk::param<bool>(pnh, "backend_rotate_world_velocity_for_frame_state", true);
   ba_interface_options.min_num_obs =

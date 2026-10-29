@@ -5,6 +5,7 @@
 #include <math.h>
 
 #include <svo/abstract_bundle_adjustment.h>
+#include <svo/map.h>
 #include <svo/vio_common/backend_types.hpp>
 
 #include "svo/ceres_backend/estimator.hpp"
@@ -59,6 +60,9 @@ struct CeresBackendOptions
 
 struct CeresBackendInterfaceOptions
 {
+  // Bounded diagnostics around the first initialized map. No estimator changes.
+  bool trace_handoff = false;
+  size_t trace_handoff_frames = 20u;
   // Historical SVO behavior rotates the latest Ceres speed vector again
   // before storing it in Frame::imu_vel_w_. Ceres propagation treats this
   // vector as world-frame velocity, so retain the behavior by default only
@@ -193,6 +197,10 @@ public:
    */
   void setImu(const std::shared_ptr<ImuHandler> imu_handler);
 
+  /// Use a deliberately selected window for gravity in the first backend
+  /// state. Subsequent inertial propagation keeps the original IMU history.
+  void setInitialGravityMeasurements(const ImuMeasurements& measurements);
+
   /**
    * @brief Initialize a performance monitor for benchmarking
    * @param trace_dir[in] path to folder where data should be dumped
@@ -277,6 +285,10 @@ protected:
   /// Run one optimization cycle. mutex_backend_ must already be locked.
   void optimizationStep();
 
+  void traceHandoff(const char* phase, const FrameBundlePtr& current,
+                    const FrameBundlePtr& previous, const Map::Ptr& map) const;
+  size_t handoff_trace_frames_ = 0u;
+
   /**
    * @brief Update the active keyframes, i.e. the keyframes that are contained
    *        in the backend.
@@ -336,6 +348,7 @@ protected:
   uint64_t global_landmark_value_version_ = 0u;
   bool image_motion_detector_stationary_ = false;
   bool imu_motion_detector_stationary_ = false;
+  ImuMeasurements initial_gravity_measurements_;
 };
 
 }  // namespace svo
