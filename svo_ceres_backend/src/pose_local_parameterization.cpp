@@ -44,6 +44,8 @@
 #include <svo/vio_common/matrix_operations.hpp>
 #include <svo/common/transformation.h>
 
+#include <cmath>
+
 namespace svo {
 namespace ceres_backend {
 
@@ -77,16 +79,31 @@ bool PoseLocalParameterization::ComputeLiftJacobian(const double* x,
 bool PoseLocalParameterization::plus(const double* x, const double* delta,
                                      double* x_plus_delta)
 {
-
+  // Ceres may call Plus repeatedly while exploring a step. Reject malformed
+  // state/step data so the optimizer can report a failed solve instead of
+  // tripping a process-wide CHECK in the quaternion invariant below.
   Eigen::Map<const Eigen::Matrix<double, 6, 1> > delta_(delta);
+  if (!delta_.allFinite())
+  {
+    return false;
+  }
 
   Quaternion q(x[6], x[3], x[4], x[5]);
-  q = Quaternion::exp(delta_.tail<3>()) * q;
-  // The product of two unit quaternions can drift by a few ulps.  Ceres calls
-  // this operation repeatedly and the debug check below uses a deliberately
-  // tight tolerance, so restore the unit-quaternion invariant explicitly
-  // before exposing the updated pose.
+  const double input_norm = q.norm();
+  if (!std::isfinite(input_norm) || input_norm < 1e-12)
+  {
+    return false;
+  }
   q.normalize();
+  q = Quaternion::exp(delta_.tail<3>()) * q;
+  // The product of two unit quaternions can drift by a few ulps. Restore the
+  // unit-quaternion invariant before exposing the updated pose.
+  q.normalize();
+  if (!std::isfinite(q.norm()) || !std::isfinite(q.x()) ||
+      !std::isfinite(q.y()) || !std::isfinite(q.z()) || !std::isfinite(q.w()))
+  {
+    return false;
+  }
 
   // copy back
   x_plus_delta[0] = x[0] + delta[0];
@@ -96,8 +113,6 @@ bool PoseLocalParameterization::plus(const double* x, const double* delta,
   x_plus_delta[4] = q.y();
   x_plus_delta[5] = q.z();
   x_plus_delta[6] = q.w();
-
-  DEBUG_CHECK_NEAR(q.norm(), 1.0, 1e-13);
 
   return true;
 }
