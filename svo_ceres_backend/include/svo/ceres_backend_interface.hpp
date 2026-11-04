@@ -1,6 +1,8 @@
 #pragma once
 
 #include <thread>
+#include <chrono>
+#include <fstream>
 #include <condition_variable>
 #include <math.h>
 
@@ -110,6 +112,9 @@ struct CeresBackendInterfaceOptions
 
   // refine extrinsics
   bool refine_extrinsics = false;
+  bool trace_motion_detector = false;
+  bool trace_consistency = false;
+  std::string consistency_trace_dir;
   double extrinsics_pos_sigma_meter = 0.05;
   double extrinsics_rot_sigma_rad = 5.0 / 180.0 * M_PI;
 };
@@ -133,6 +138,9 @@ public:
                         const CameraBundlePtr& camera_bundle);
 
   ~CeresBackendInterface();
+
+  // Bench only: bounded wall-clock lease; never resets pose or overwrites velocity.
+  bool requestStationaryBoxTest(double image_start_stamp, double duration_seconds);
 
   /**
    * @brief This is called BEFORE frame is processed in frontend
@@ -199,7 +207,10 @@ public:
 
   /// Use a deliberately selected window for gravity in the first backend
   /// state. Subsequent inertial propagation keeps the original IMU history.
-  void setInitialGravityMeasurements(const ImuMeasurements& measurements);
+  void setInitialBiases(const Eigen::Vector3d& gyro, const Eigen::Vector3d& accel);
+  void setInitialGravityMeasurements(const ImuMeasurements& measurements,
+                                    bool initialize_gyro_bias = false,
+                                    bool initialize_radial_accel_bias = false);
 
   /**
    * @brief Initialize a performance monitor for benchmarking
@@ -258,7 +269,11 @@ protected:
   Estimator backend_;
   std::shared_ptr<ImuHandler> imu_handler_;
   std::unique_ptr<MotionDetector> motion_detector_;
-  size_t no_motion_counter_;
+  size_t no_motion_counter_ = 0;
+  bool stationary_box_test_active_ = false;
+  double stationary_box_test_image_start_ = 0;
+  double stationary_box_test_duration_ = 0;
+  std::chrono::steady_clock::time_point stationary_box_test_deadline_;
   std::unique_ptr<OutlierRejection> outlier_rejection_;
 
   /**
@@ -345,6 +360,17 @@ protected:
 
   // fixation
   std::atomic_bool lock_to_fixed_landmarks_ {false};
+  uint64_t consistency_sequence_ = 0;
+  const uint64_t consistency_instance_ = static_cast<uint64_t>(
+      std::chrono::steady_clock::now().time_since_epoch().count());
+  std::chrono::steady_clock::time_point consistency_last_sample_;
+  std::chrono::steady_clock::time_point consistency_last_feedback_;
+  std::ofstream consistency_trace_;
+  bool consistency_trace_open_attempted_ = false;
+  size_t consistency_trace_bytes_ = 0;
+  void writeConsistencyRecord(const std::string& record);
+  std::string frontendConsistencySnapshot(const FrameBundlePtr& previous,
+                                           const Map::Ptr& map) const;
   uint64_t global_landmark_value_version_ = 0u;
   bool image_motion_detector_stationary_ = false;
   bool imu_motion_detector_stationary_ = false;

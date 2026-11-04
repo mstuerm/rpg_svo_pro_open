@@ -2,6 +2,10 @@
 
 #include <ros/callback_queue.h>
 #include <chrono>
+#include <algorithm>
+#include <cmath>
+#include <iomanip>
+#include <sstream>
 #include <std_msgs/Float64MultiArray.h>
 
 #include <unordered_map>
@@ -66,7 +70,24 @@ SvoInterface::SvoInterface(
       vk::param<bool>(pnh_, "automatic_reinitialization", false))
 {
   trace_processing_stages_ = vk::param<bool>(pnh_, "trace_processing_stages", false);
+  gravity_initialization_duration_ =
+      vk::param<double>(pnh_, "gravity_initialization_duration", 0.0);
+  CHECK(std::isfinite(gravity_initialization_duration_) &&
+        gravity_initialization_duration_ >= 0.0);
+  pub_gravity_initialization_ =
+      pnh_.advertise<std_msgs::String>("gravity_initialization", 10, true);
   pub_remote_key_status_ = pnh_.advertise<std_msgs::String>("remote_key_status", 10, true);
+  require_stationary_calibration_ =
+      vk::param<bool>(pnh_, "require_stationary_calibration", false);
+  stationary_calibration_duration_ =
+      vk::param<double>(pnh_, "stationary_calibration_duration", 10.0);
+  CHECK(std::isfinite(stationary_calibration_duration_) &&
+        stationary_calibration_duration_ >= 1.0);
+  pub_stationary_calibration_ =
+      pnh_.advertise<std_msgs::String>("stationary_calibration", 10, true);
+  publishStationaryCalibration("idle");
+  stationary_calibration_timer_ = nh_.createTimer(ros::Duration(0.5),
+      &SvoInterface::collectStationaryCalibration, this);
   if (trace_processing_stages_)
   {
     pub_processing_stage_ = pnh_.advertise<std_msgs::String>("processing_stage", 10, true);
@@ -173,11 +194,8 @@ void SvoInterface::traceProcessingStage(const char* stage, int64_t timestamp_nan
   pub_processing_stage_.publish(message);
 }
 
-void SvoInterface::processImageBundle(
-    const std::vector<cv::Mat>& images,
-    const int64_t timestamp_nanoseconds)
+void SvoInterface::ensureBackend()
 {
-  const bool first_initialization_image = !svo_->hasStarted();
   if (!svo_->isBackendValid())
   {
     if (vk::param<bool>(pnh_, "use_ceres_backend", false, true))
@@ -196,6 +214,14 @@ void SvoInterface::processImageBundle(
       }
     }
   }
+}
+
+void SvoInterface::processImageBundle(
+    const std::vector<cv::Mat>& images,
+    const int64_t timestamp_nanoseconds)
+{
+  const bool first_initialization_image = !svo_->hasStarted();
+  ensureBackend();
   svo_->addImageBundle(images, timestamp_nanoseconds);
   if (first_initialization_image && svo_->getLastFrames())
   {
@@ -389,8 +415,159 @@ void SvoInterface::publishPampcLandmarks(
   pub_pampc_landmarks_.publish(cloud);
 }
 
+void SvoInterface::publishStationaryCalibration(
+    const std::string& phase, const std::string& detail)
+{
+  std_msgs::String status;
+  status.data = "phase=" + phase + " required=" +
+      (require_stationary_calibration_ ? "true" : "false") +
+      " duration_s=" + std::to_string(stationary_calibration_duration_) +
+      (detail.empty() ? "" : " " + detail);
+  pub_stationary_calibration_.publish(status);
+  ROS_INFO_STREAM("SVO_STATIONARY_CALIBRATION " << status.data);
+}
+
+void SvoInterface::collectStationaryCalibration(const ros::TimerEvent&)
+{
+  std::lock_guard<std::mutex> lock(pipeline_mutex_);
+  if (!stationary_calibration_pending_ || !imu_handler_) return;
+  const double now = ros::Time::now().toSec();
+  const double end = stationary_calibration_start_ + stationary_calibration_duration_;
+  if (now < end) {
+    publishStationaryCalibration("collecting", "elapsed_s=" +
+        std::to_string(std::max(0.0, now - stationary_calibration_start_)));
+    return;
+  }
+  const auto history = imu_handler_->getMeasurementsCopy();
+  ImuMeasurements selected;
+  for (const auto& m : history)
+    if (m.timestamp_ >= stationary_calibration_start_ && m.timestamp_ <= end &&
+        m.linear_acceleration_.allFinite() && m.angular_velocity_.allFinite())
+      selected.push_back(m);
+  std::sort(selected.begin(), selected.end(), [](const ImuMeasurement& a,
+                                                const ImuMeasurement& b) {
+    return a.timestamp_ > b.timestamp_;
+  });
+  double gap = 0.0;
+  for (size_t i = 1; i < selected.size(); ++i)
+    gap = std::max(gap, selected[i-1].timestamp_ - selected[i].timestamp_);
+  const double tolerance = imu_handler_->imu_calib_.max_imu_delta_t;
+  const bool covered = selected.size() >= 2u &&
+      selected.back().timestamp_ - stationary_calibration_start_ <= tolerance &&
+      end - selected.front().timestamp_ <= tolerance && gap <= tolerance;
+  if (!covered) {
+    if (now > end + 2.0) {
+      stationary_calibration_pending_ = false;
+      publishStationaryCalibration("failed", "reason=missing_imu_coverage");
+    }
+    return;
+  }
+  Eigen::Vector3d acc = Eigen::Vector3d::Zero();
+  Eigen::Vector3d gyro = Eigen::Vector3d::Zero();
+  for (const auto& m : selected) {
+    acc += m.linear_acceleration_;
+    gyro += m.angular_velocity_;
+  }
+  acc /= selected.size(); gyro /= selected.size();
+  double avar = 0.0, gvar = 0.0;
+  for (const auto& m : selected) {
+    avar += (m.linear_acceleration_ - acc).squaredNorm();
+    gvar += (m.angular_velocity_ - gyro).squaredNorm();
+  }
+  const double astd = std::sqrt(avar / selected.size());
+  const double gstd = std::sqrt(gvar / selected.size());
+  const double gravity = imu_handler_->imu_calib_.gravity_magnitude;
+  std::ostringstream stats;
+  stats << std::setprecision(17) << "first_imu=" << selected.back().timestamp_
+        << " last_imu=" << selected.front().timestamp_ << " count=" << selected.size()
+        << " max_gap_s=" << gap << " accel_std=" << astd << " gyro_std=" << gstd
+        << " accel_norm=" << acc.norm() << " gyro_mean_norm=" << gyro.norm();
+  stationary_calibration_pending_ = false;
+  if (astd > vk::param<double>(pnh_, "stationary_calibration_max_accel_std", 0.1) ||
+      gstd > vk::param<double>(pnh_, "stationary_calibration_max_gyro_std", 0.015) ||
+      gyro.norm() > vk::param<double>(pnh_, "stationary_calibration_max_gyro_mean", 0.03) ||
+      std::abs(acc.norm() - gravity) > 0.5) {
+    publishStationaryCalibration("failed", "reason=not_stationary_or_implausible " + stats.str());
+    return;
+  }
+  stationary_gyro_bias_ = gyro;
+  stationary_accel_bias_ = acc - gravity * acc.normalized();
+  stationary_calibration_ready_ = true;
+  ceres_backend_interface_->setInitialBiases(stationary_gyro_bias_, stationary_accel_bias_);
+  stats << " gyro_bias=[" << stationary_gyro_bias_.transpose()
+        << "] accel_bias=[" << stationary_accel_bias_.transpose() << "]";
+  publishStationaryCalibration("ready", stats.str());
+  // Remain idle until explicit frontend START, even if the drone takes off.
+}
+
+bool SvoInterface::collectInitialGravity(const int64_t timestamp_nanoseconds)
+{
+  if (!gravity_initialization_pending_) return true;
+  if (!imu_handler_ || !ceres_backend_interface_) return false;
+  const double end = gravity_initialization_start_ + gravity_initialization_duration_;
+  const double image_imu_time = timestamp_nanoseconds * 1e-9 -
+      imu_handler_->imu_calib_.delay_imu_cam;
+  if (image_imu_time < end) return false;
+  const auto history = imu_handler_->getMeasurementsCopy();
+  if (history.empty() || history.front().timestamp_ < end) return false;
+  ImuMeasurements selected;
+  for (const auto& m : history)
+    if (m.timestamp_ >= gravity_initialization_start_ && m.timestamp_ <= end &&
+        m.linear_acceleration_.allFinite() && m.angular_velocity_.allFinite())
+      selected.push_back(m);
+  std::sort(selected.begin(), selected.end(), [](const ImuMeasurement& a,
+                                                const ImuMeasurement& b) {
+    return a.timestamp_ > b.timestamp_;
+  });
+  if (selected.size() < 2u) return false;
+  const double tolerance = imu_handler_->imu_calib_.max_imu_delta_t;
+  double max_gap = 0.0;
+  for (size_t i = 1; i < selected.size(); ++i)
+    max_gap = std::max(max_gap, selected[i-1].timestamp_ - selected[i].timestamp_);
+  if (selected.back().timestamp_ - gravity_initialization_start_ > tolerance ||
+      end - selected.front().timestamp_ > tolerance || max_gap > tolerance)
+  {
+    ROS_WARN_THROTTLE(1.0, "Fresh gravity window has missing IMU coverage; not using older history");
+    return false;
+  }
+  Eigen::Vector3d mean = Eigen::Vector3d::Zero();
+  double gyro_squared = 0.0;
+  for (const auto& m : selected) {
+    mean += m.linear_acceleration_;
+    gyro_squared += m.angular_velocity_.squaredNorm();
+  }
+  mean /= selected.size();
+  if (mean.norm() < 1.0) return false;
+  double accel_variance = 0.0;
+  for (const auto& m : selected)
+    accel_variance += (m.linear_acceleration_ - mean).squaredNorm();
+  gravity_initialization_measurements_ = selected;
+  // Opt in only when this window is stationary (e.g. floor bench), not a hover.
+  ceres_backend_interface_->setInitialGravityMeasurements(selected,
+      !stationary_calibration_ready_ &&
+          vk::param<bool>(pnh_, "initialize_gyro_bias_from_gravity_window", false),
+      !stationary_calibration_ready_ &&
+          vk::param<bool>(pnh_, "initialize_radial_accel_bias_from_gravity_window", false));
+  gravity_initialization_pending_ = false;
+  std::ostringstream out;
+  out << std::setprecision(17)
+      << "phase=ready requested_start=" << gravity_initialization_start_
+      << " requested_end=" << end
+      << " first_imu=" << selected.back().timestamp_
+      << " last_imu=" << selected.front().timestamp_
+      << " count=" << selected.size() << " max_gap_s=" << max_gap
+      << " mean_accel_imu=[" << mean.transpose() << "]"
+      << " accel_std_norm=" << std::sqrt(accel_variance / selected.size())
+      << " gyro_rms_rad_s=" << std::sqrt(gyro_squared / selected.size());
+  std_msgs::String status; status.data = out.str();
+  pub_gravity_initialization_.publish(status);
+  ROS_INFO_STREAM("SVO_INIT_GRAVITY " << status.data);
+  return true;
+}
+
 bool SvoInterface::setImuPrior(const int64_t timestamp_nanoseconds)
 {
+  if (!collectInitialGravity(timestamp_nanoseconds)) return false;
   if(svo_->getBundleAdjuster())
   {
     //if we use backend, this will take care of setting priors
@@ -642,7 +819,48 @@ void SvoInterface::inputKeyCallback(const std_msgs::StringConstPtr& key_input)
       quit_ = true;
       SVO_INFO_STREAM("SVO user input: QUIT");
       break;
+    case 'b':
+      if (!imu_handler_ || !vk::param<bool>(pnh_, "use_ceres_backend", false)) {
+        publishStationaryCalibration("failed", "reason=requires_imu_and_ceres");
+        return;
+      }
+      svo_->resetForInitialization();
+      ceres_backend_interface_.reset();
+      ensureBackend();
+      gravity_initialization_pending_ = false;
+      gravity_initialization_measurements_.clear();
+      stationary_calibration_ready_ = false;
+      stationary_calibration_pending_ = true;
+      stationary_calibration_start_ = ros::Time::now().toSec();
+      idle_ = true;  // IMU collection only: do not create a visual map or states.
+      pampc_landmark_persistence_.clear();
+      publishStationaryCalibration("collecting", "elapsed_s=0");
+      break;
+    case 'v':
+      // Explicit bench opt-in; operator confirms disarmed and stationary.
+      if (!vk::param<bool>(pnh_, "stationary_box_test_enabled", false) ||
+          !ceres_backend_interface_ || svo_->stage() != Stage::kTracking) {
+        ROS_WARN("SVO_BOX_TEST rejected: require bench opt-in and tracking backend");
+        return;
+      }
+      if (!ceres_backend_interface_->requestStationaryBoxTest(
+              ros::Time::now().toSec(), 10.0)) {
+        ROS_WARN("SVO_BOX_TEST rejected: backend not ready");
+        return;
+      }
+      ROS_WARN("SVO_BOX_TEST started: keep disarmed and stationary for 10 seconds");
+      break;
+    case 'V':
+      if (ceres_backend_interface_)
+        ceres_backend_interface_->requestStationaryBoxTest(0, 0);
+      break;
     case 'r':
+      if (stationary_calibration_pending_) {
+        stationary_calibration_pending_ = false;
+        publishStationaryCalibration("cancelled", "reason=reset_during_collection");
+      }
+      gravity_initialization_pending_ = false;
+      gravity_initialization_measurements_.clear();
       svo_->reset();
       pampc_landmark_persistence_.clear();
       // FrameHandlerBase::reset() is deferred until the end of the next
@@ -652,11 +870,39 @@ void SvoInterface::inputKeyCallback(const std_msgs::StringConstPtr& key_input)
       SVO_INFO_STREAM("SVO user input: RESET");
       break;
     case 's':
+      if (stationary_calibration_pending_ ||
+          (require_stationary_calibration_ && !stationary_calibration_ready_)) {
+        ROS_WARN("SVO START rejected: complete stationary backend calibration first");
+        return;
+      }
       // Retire the old map/backend before the next image selects its reference.
       // processImageBundle will create the fresh backend BEFORE addFrameBundle,
       // allowing its gravity prior to set the very first reference pose.
       svo_->resetForInitialization();
       ceres_backend_interface_.reset();
+      // Construct the backend before beginning the timed hover window. Its
+      // setup cost must not separate the first two visual reference images.
+      ensureBackend();
+      if (stationary_calibration_ready_) {
+        ceres_backend_interface_->setInitialBiases(
+            stationary_gyro_bias_, stationary_accel_bias_);
+        publishStationaryCalibration("ready", "reused_for_visual_initialization=true");
+      }
+      gravity_initialization_measurements_.clear();
+      gravity_initialization_pending_ = gravity_initialization_duration_ > 0.0;
+      gravity_initialization_start_ = ros::Time::now().toSec();
+      if (gravity_initialization_pending_)
+      {
+        if (!imu_handler_ || !ceres_backend_interface_) {
+          ROS_ERROR("Fresh gravity initialization requires IMU and Ceres backend");
+          return;
+        }
+        std_msgs::String status;
+        status.data = "phase=collecting start=" + std::to_string(gravity_initialization_start_) +
+            " duration=" + std::to_string(gravity_initialization_duration_);
+        pub_gravity_initialization_.publish(status);
+        ROS_INFO_STREAM("SVO_INIT_GRAVITY " << status.data);
+      }
       svo_->start();
       pampc_landmark_persistence_.clear();
       idle_ = false;
@@ -672,7 +918,7 @@ void SvoInterface::inputKeyCallback(const std_msgs::StringConstPtr& key_input)
       break;
     default: ;
   }
-  if (input == 'r' || input == 's')
+  if (input == 'r' || input == 's' || input == 'b')
   {
     // Confirm that this SVO process handled the command. A ROS publisher's
     // connection count can otherwise be satisfied by rosbag alone.

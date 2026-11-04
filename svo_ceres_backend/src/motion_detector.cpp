@@ -7,8 +7,10 @@ namespace svo
 bool MotionDetector::isImageMoving(double &sigma) const
 {
   last_check_valid_ = false;
-  if(!last_frames_)
+  diagnostics_ = Diagnostics();
+  if(!last_frames_ || !new_frames_)
   {
+    diagnostics_.reason = "missing_frames";
     return true;
   }
 
@@ -16,6 +18,7 @@ bool MotionDetector::isImageMoving(double &sigma) const
   if(last_frames_->numFeatures() < size_t(opt_.min_number_correspondences)
      || new_frames_->numFeatures() < size_t(opt_.min_number_correspondences))
   {
+    diagnostics_.reason = "too_few_features";
     return true;
   }
 
@@ -24,9 +27,11 @@ bool MotionDetector::isImageMoving(double &sigma) const
   Keypoints features_new(2, opt_.max_features_to_check);
   int num_correspondences = findFeatureCorrespondences(features_last,
                                                                features_new);
+  diagnostics_.correspondences = num_correspondences;
 
   if(num_correspondences < opt_.min_number_correspondences)
   {
+    diagnostics_.reason = "too_few_correspondences";
     return true;
   }
 
@@ -34,20 +39,25 @@ bool MotionDetector::isImageMoving(double &sigma) const
   last_check_valid_ = true;
   const int n_moving_pixels_threshold =
       static_cast<int>(opt_.ratio_moving_pixels_threshold*num_correspondences);
+  diagnostics_.allowed_moving = n_moving_pixels_threshold;
   int n_moving_pixels = 0;
   for(int i = 0; i < num_correspondences; ++i)
   {
     //compute pixel distance
-    if((features_last.col(i)-features_new.col(i)).norm()
-       > opt_.px_diff_threshold)
+    const double displacement = (features_last.col(i)-features_new.col(i)).norm();
+    if(displacement > diagnostics_.max_displacement_px)
+      diagnostics_.max_displacement_px = displacement;
+    if(displacement > opt_.px_diff_threshold)
     {
       ++n_moving_pixels;
-      if(n_moving_pixels > n_moving_pixels_threshold)
-      {
-        return true;
-      }
     }
   }
+  diagnostics_.moving = n_moving_pixels;
+  if(n_moving_pixels > n_moving_pixels_threshold) {
+    diagnostics_.reason = "pixel_motion";
+    return true;
+  }
+  diagnostics_.reason = "stationary";
   //! @todo more sophisticated assignment of sigma
   sigma = opt_.sigma;
   return false;

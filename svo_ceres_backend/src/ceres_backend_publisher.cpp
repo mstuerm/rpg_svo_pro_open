@@ -4,6 +4,7 @@
 #include <geometry_msgs/Vector3Stamped.h>
 #include <nav_msgs/Odometry.h>
 #include <visualization_msgs/Marker.h>
+#include <std_msgs/String.h>
 
 #include <vikit/output_helper.h>
 #include <vikit/params_helper.h>
@@ -45,6 +46,15 @@ CeresBackendPublisher::CeresBackendPublisher(
       pnh_.advertise<geometry_msgs::Vector3Stamped>("backend_acc_bias", 10);
   pub_points_ =
       pnh_.advertise<PointCloud>("backend_points", 10);
+  pub_consistency_ = pnh_.advertise<std_msgs::String>("backend_consistency", 2);
+}
+
+void CeresBackendPublisher::publishConsistency(const std::string& record)
+{
+  if (pub_consistency_.getNumSubscribers() == 0) return;
+  std_msgs::String message;
+  message.data = record;
+  pub_consistency_.publish(message);
 }
 
 void CeresBackendPublisher::publish(const ViNodeState& state,

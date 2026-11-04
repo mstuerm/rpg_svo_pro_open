@@ -48,6 +48,15 @@ public:
     return last_check_valid_;
   }
 
+  struct Diagnostics {
+    const char* reason = "not_checked";
+    int correspondences = 0;
+    int moving = 0;
+    int allowed_moving = 0;
+    double max_displacement_px = 0;
+  };
+  const Diagnostics& diagnostics() const { return diagnostics_; }
+
 private:
   FrameBundlePtr last_frames_;
   FrameBundlePtr new_frames_;
@@ -74,5 +83,6 @@ private:
                                  const int track_id,
                                  Keypoint *last_px) const;
   mutable bool last_check_valid_ = false;
+  mutable Diagnostics diagnostics_;
 };
 } //namespace svo

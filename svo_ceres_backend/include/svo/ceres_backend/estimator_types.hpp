@@ -134,6 +134,7 @@ struct ImuParameters
   double sigma_gw_c; ///< Gyroscope drift noise density. [rad/s^2*1/sqrt(Hz)]
   double sigma_aw_c; ///< Accelerometer drift noise density. [m/s^3*1/sqrt(Hz)]
   double g;  ///< Earth acceleration. [m/s^2]
+  Eigen::Vector3d g0 = Eigen::Vector3d::Zero();  ///< Initial residual gyro bias, rad/s.
   Eigen::Vector3d a0 = Eigen::Vector3d::Zero();
   ///< Mean of the prior acceleration bias. [m/s^2*1/sqrt(Hz)]
   double rate = 200;  ///< IMU rate. [Hz].

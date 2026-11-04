@@ -65,6 +65,12 @@ CeresBackendInterface::Ptr makeBackend(const ros::NodeHandle& pnh,
       (vk::param<int>(pnh, "ceres_max_fixed_landmarks", 50u));
 
   CeresBackendInterfaceOptions ba_interface_options;
+  ba_interface_options.trace_motion_detector =
+      vk::param<bool>(pnh, "backend_trace_motion_detector", false);
+  ba_interface_options.trace_consistency =
+      vk::param<bool>(pnh, "backend_trace_consistency", false);
+  ba_interface_options.consistency_trace_dir =
+      vk::param<std::string>(pnh, "trace_dir", "/tmp");
   ba_interface_options.trace_handoff =
       vk::param<bool>(pnh, "backend_trace_handoff", false);
   const int handoff_frames = vk::param<int>(pnh, "backend_trace_handoff_frames", 20);

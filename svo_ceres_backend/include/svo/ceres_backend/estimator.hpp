@@ -191,6 +191,10 @@ class Estimator
    */
   int addImu(const svo::ImuParameters& imu_parameters);
 
+  // Only before the first state; also centers the initial bias prior.
+  void setInitialGyroscopeBias(const Eigen::Vector3d& bias);
+  void setInitialAccelerometerBias(const Eigen::Vector3d& bias);
+
   /**
    * @brief Remove all cameras from the configuration
    */
@@ -271,7 +275,8 @@ class Estimator
    * @return True if successful.
    */
   static bool initPoseFromImu(const ImuMeasurements &imu_measurements,
-      Transformation& T_WS);
+      Transformation& T_WS,
+      const Eigen::Vector3d& accel_bias = Eigen::Vector3d::Zero());
 
   /**
    * @brief Start ceres optimization.
@@ -393,6 +398,10 @@ class Estimator
    * @return True if successful.
    */
   bool getLandmark(BackendId landmark_id, MapPoint& map_point) const;
+
+  // Read-only diagnostics; caller holds the backend mutex. Uses live parameter
+  // blocks (not cached landmark coordinates), preserving IDs across snapshots.
+  std::string diagnosticSnapshot(size_t max_landmarks, bool evaluate_residuals) const;
 
 
   /**

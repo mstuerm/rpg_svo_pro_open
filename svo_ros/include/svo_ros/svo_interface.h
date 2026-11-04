@@ -77,6 +77,20 @@ public:
   bool gravity_initialization_pending_ = false;
   ImuMeasurements gravity_initialization_measurements_;
   ros::Publisher pub_gravity_initialization_;
+  // Cached calibration survives map/backend resets. No pre-flight position or
+  // velocity state is carried into visual initialization.
+  bool require_stationary_calibration_ = false;
+  bool stationary_calibration_pending_ = false;
+  bool stationary_calibration_ready_ = false;
+  double stationary_calibration_duration_ = 10.0;
+  double stationary_calibration_start_ = 0.0;
+  Eigen::Vector3d stationary_gyro_bias_ = Eigen::Vector3d::Zero();
+  Eigen::Vector3d stationary_accel_bias_ = Eigen::Vector3d::Zero();
+  ros::Publisher pub_stationary_calibration_;
+  ros::Timer stationary_calibration_timer_;
+  void collectStationaryCalibration(const ros::TimerEvent&);
+  void publishStationaryCalibration(const std::string& phase,
+                                   const std::string& detail = "");
   // Remote reset/start commands arrive on ROS's callback thread while images
   // are processed on image_thread_. Resetting the Ceres backend concurrently
   // with addFrameBundle() invalidates backend state underneath the optimizer.

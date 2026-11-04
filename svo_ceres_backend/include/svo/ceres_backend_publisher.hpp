@@ -46,6 +46,7 @@ public:
 
   void publish(const ViNodeState& state, const int64_t timestamp,
                const int32_t seq);
+  void publishConsistency(const std::string& record);
 
 private:
   ros::NodeHandle pnh_;
@@ -66,6 +67,7 @@ private:
   ros::Publisher pub_gyro_bias_;
   ros::Publisher pub_acc_bias_;
   ros::Publisher pub_points_;
+  ros::Publisher pub_consistency_;
 
   // publisher functions
   void publishImuPose(const ViNodeState& state, const int64_t timestamp,

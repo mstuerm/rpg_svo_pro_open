@@ -41,6 +41,11 @@
  */
 
 #include "svo/ceres_backend/estimator.hpp"
+#include <sstream>
+#include <iomanip>
+#include <limits>
+#include <cmath>
+#include <cstdint>
 
 #include <svo/common/conversions.h>
 #include <svo/common/point.h>
@@ -114,6 +119,22 @@ void Estimator::addCameraBundle(
 }
 
 // Add an IMU to the configuration.
+void Estimator::setInitialGyroscopeBias(const Eigen::Vector3d& bias)
+{
+  CHECK(states_.ids.empty());
+  CHECK(bias.allFinite());
+  CHECK_EQ(imu_parameters_.size(), 1u);
+  imu_parameters_.at(0).g0 = bias;
+}
+
+void Estimator::setInitialAccelerometerBias(const Eigen::Vector3d& bias)
+{
+  CHECK(states_.ids.empty());
+  CHECK(bias.allFinite());
+  CHECK_EQ(imu_parameters_.size(), 1u);
+  imu_parameters_.at(0).a0 = bias;
+}
+
 int Estimator::addImu(const ImuParameters& imu_parameters)
 {
   if(imu_parameters_.size() > 1)
@@ -173,13 +194,14 @@ bool Estimator::addStates(const FrameBundleConstPtr& frame_bundle,
     else
     {
       // in case this is the first frame ever, let's initialize the pose:
-      bool success0 = initPoseFromImu(imu_measurements, T_WS);
+      bool success0 = initPoseFromImu(imu_measurements, T_WS, imu_parameters_.at(0).a0);
       DEBUG_CHECK(success0) << "pose could not be initialized from imu measurements.";
       if (!success0)
       {
         return false;
       }
       speed_and_bias.setZero();
+      speed_and_bias.segment<3>(3) = imu_parameters_.at(0).g0;
       speed_and_bias.segment<3>(6) = imu_parameters_.at(0).a0;
     }
   }
@@ -1111,7 +1133,7 @@ void Estimator::printStates(BackendId pose_id, std::ostream& buffer) const
 // Initialise pose from IMU measurements. For convenience as static.
 bool Estimator::initPoseFromImu(
     const ImuMeasurements &imu_measurements,
-    Transformation& T_WS)
+    Transformation& T_WS, const Eigen::Vector3d& accel_bias)
 {
   // set translation to zero, unit rotation
   T_WS.setIdentity();
@@ -1130,6 +1152,7 @@ bool Estimator::initPoseFromImu(
     acc_B += imu_measurements[i].linear_acceleration_;
   }
   acc_B /= static_cast<double>(n_measurements);
+  acc_B -= accel_bias;  // Use the seeded residual bias for gravity too.
   Eigen::Vector3d e_acc = acc_B.normalized();
 
   // align with ez_W:
@@ -1271,6 +1294,119 @@ bool Estimator::setOptimizationTimeLimit(double time_limit, int min_iterations)
 }
 
 // getters
+
+// Snapshot live Ceres parameters without changing the optimization problem.
+// Caller serializes this with optimization through mutex_backend_.
+std::string Estimator::diagnosticSnapshot(
+    size_t max_landmarks, bool evaluate_residuals) const
+{
+  std::ostringstream out;
+  out << std::setprecision(12);
+  const auto number = [&out](double value) {
+    if (std::isfinite(value)) out << value; else out << "null";
+  };
+  const auto vector = [&out, &number](const Eigen::VectorXd& value) {
+    out << '[';
+    for (int k = 0; k < value.size(); ++k) { if (k) { out << ','; } number(value[k]); }
+    out << ']';
+  };
+  out << "{\"state_count\":" << states_.ids.size()
+      << ",\"landmark_count\":" << landmarks_map_.size()
+      << ",\"fixed_landmark_count\":" << numFixedLandmarks()
+      << ",\"need_pose_fixation\":" << (needPoseFixation() ? "true" : "false")
+      << ",\"has_marginalization_prior\":" << (hasPrior() ? "true" : "false")
+      << ",\"fixed_pose_ids\":[";
+  bool first = true;
+  for (const auto id : fixed_frame_parameter_ids_) {
+    if (!first) { out << ','; } first = false; out << '"' << id << '"';
+  }
+  out << "],\"states\":[";
+  first = true;
+  for (size_t j = 0; j < states_.ids.size(); ++j) {
+    if (j >= 31 && j + 1 < states_.ids.size()) continue; // oldest and newest retained
+    const BackendId id = states_.ids[j];
+    Transformation pose;
+    SpeedAndBias sb;
+    if (!get_T_WS(id, pose) || !getSpeedAndBias(id, sb)) continue;
+    if (!first) { out << ','; } first = false;
+    const auto q = pose.getRotation().toImplementation();
+    out << "{\"id\":\"" << id.asInteger() << "\",\"stamp\":";
+    number(states_.timestamps[j]);
+    out << ",\"keyframe\":" << (states_.is_keyframe[j] ? "true" : "false")
+        << ",\"pose_prior_registered\":"
+        << (fixed_frame_parameter_ids_.count(id.asInteger()) ? "true" : "false")
+        << ",\"parameter_constant\":"
+        << (map_ptr_->isParameterBlockConstant(id.asInteger()) ? "true" : "false")
+        << ",\"p\":"; vector(pose.getPosition());
+    out << ",\"q_xyzw\":"; vector(q.coeffs());
+    out << ",\"velocity_gyro_bias_acc_bias\":"; vector(sb);
+    out << '}';
+  }
+  out << "],\"landmarks\":[";
+  first = true;
+  size_t sampled = 0;
+  for (const auto& item : landmarks_map_) {
+    if (sampled++ >= std::min<size_t>(max_landmarks, 24)) break;
+    auto block = map_ptr_->parameterBlockPtr(item.first.asInteger());
+    if (!block) continue;
+    const auto point = std::static_pointer_cast<ceres_backend::HomogeneousPointParameterBlock>(block);
+    if (!first) { out << ','; } first = false;
+    out << "{\"id\":\"" << item.first.asInteger() << "\",\"homogeneous\":";
+    vector(point->estimate());
+    out << ",\"point_id\":" << (item.second.point ? item.second.point->id() : -1)
+        << ",\"observations\":" << item.second.observations.size()
+        << ",\"fixed_registered\":" << (isLandmarkFixed(item.first.asInteger()) ? "true" : "false")
+        << ",\"parameter_constant\":"
+        << (map_ptr_->isParameterBlockConstant(item.first.asInteger()) ? "true" : "false") << '}';
+  }
+  // Stable address order within a run keeps sampled residual IDs comparable.
+  std::map<uintptr_t, ceres_backend::Map::ResidualBlockSpec> blocks;
+  std::map<int, size_t> counts, evaluated;
+  for (const auto& item : map_ptr_->residualBlockIdToResidualBlockSpecMap()) {
+    counts[static_cast<int>(item.second.error_interface_ptr->typeInfo())]++;
+    if (evaluate_residuals)
+      blocks.emplace(reinterpret_cast<uintptr_t>(item.first), item.second);
+  }
+  out << "],\"residual_counts\":{";
+  first = true;
+  for (const auto& c : counts) {
+    if (!first) { out << ','; } first = false; out << '"' << c.first << "\":" << c.second;
+  }
+  out << "},\"sampled_whitened_residuals\":[";
+  first = true;
+  for (const auto& item : blocks) {
+    const auto& error = item.second.error_interface_ptr;
+    const int type = static_cast<int>(error->typeInfo());
+    if (error->typeInfo() == ceres_backend::ErrorType::kMarginalizationError ||
+        evaluated[type] >= 8 || error->residualDim() > 128) continue;
+    const auto parameters = map_ptr_->parameters(item.second.residual_block_id);
+    std::vector<const double*> values;
+    for (const auto& p : parameters) values.push_back(p.second->parameters());
+    if (values.size() != error->parameterBlocks()) continue;
+    std::vector<double> residual(error->residualDim());
+    const bool ok = error->EvaluateWithMinimalJacobians(values.data(), residual.data(), nullptr, nullptr);
+    ++evaluated[type];
+    if (!first) { out << ','; } first = false;
+    out << "{\"id\":\"" << item.first << "\",\"type\":" << type
+        << ",\"ok\":" << (ok ? "true" : "false") << ",\"parameter_ids\":[";
+    for (size_t k = 0; k < parameters.size(); ++k) {
+      if (k) { out << ','; } out << '"' << parameters[k].first << '"';
+    }
+    out << "],\"values\":[";
+    for (size_t k = 0; k < residual.size(); ++k) {
+      if (k) { out << ','; } number(ok ? residual[k] : std::numeric_limits<double>::quiet_NaN());
+    }
+    out << "]}";
+  }
+  out << "],\"last_solver_summary\":{\"initial_cost\":";
+  number(map_ptr_->summary.initial_cost);
+  out << ",\"final_cost\":"; number(map_ptr_->summary.final_cost);
+  out << ",\"termination_type\":" << static_cast<int>(map_ptr_->summary.termination_type)
+      << ",\"successful_steps\":" << map_ptr_->summary.num_successful_steps
+      << ",\"unsuccessful_steps\":" << map_ptr_->summary.num_unsuccessful_steps << "}}";
+  return out.str();
+}
+
 // Get a specific landmark.
 bool Estimator::getLandmark(BackendId landmark_id,
                             MapPoint& map_point) const

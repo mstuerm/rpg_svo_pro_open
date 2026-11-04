@@ -10,6 +10,7 @@
 #include <iomanip>
 #include <set>
 #include <sstream>
+#include <sys/statvfs.h>
 
 #include "svo/motion_detector.hpp"
 #include "svo/outlier_rejection.hpp"
@@ -69,6 +70,28 @@ CeresBackendInterface::CeresBackendInterface(
 
   backend_.min_num_3d_points_for_fixation_ =
       optimizer_options_.remove_fixation_min_num_fixed_landmarks_;
+}
+
+bool CeresBackendInterface::requestStationaryBoxTest(
+    double image_start_stamp, double duration_seconds)
+{
+  std::lock_guard<std::mutex> lock(mutex_backend_);
+  if (duration_seconds == 0) {
+    stationary_box_test_active_ = false;
+    LOG(INFO) << "SVO_BOX_TEST phase=cancelled";
+    return true;
+  }
+  if (!std::isfinite(image_start_stamp) || !std::isfinite(duration_seconds) ||
+      duration_seconds <= 0 || duration_seconds > 10 || backend_.numFrames() == 0)
+    return false;
+  stationary_box_test_image_start_ = image_start_stamp;
+  stationary_box_test_duration_ = duration_seconds;
+  stationary_box_test_deadline_ = std::chrono::steady_clock::now() +
+      std::chrono::milliseconds(static_cast<int>(duration_seconds * 1000));
+  stationary_box_test_active_ = true;
+  LOG(INFO) << "SVO_BOX_TEST phase=armed duration_s=" << duration_seconds
+            << " sigma_m_s=0.01 image_start=" << std::setprecision(17) << image_start_stamp;
+  return true;
 }
 
 CeresBackendInterface::~CeresBackendInterface()
@@ -144,6 +167,62 @@ void CeresBackendInterface::traceHandoff(
   LOG(INFO) << out.str();
 }
 
+std::string CeresBackendInterface::frontendConsistencySnapshot(
+    const FrameBundlePtr& previous, const Map::Ptr& map) const
+{
+  std::map<int, FramePtr> frames;
+  if (map) for (const auto& entry : map->keyframes_)
+    if (entry.second) frames.emplace(entry.second->id(), entry.second);
+  if (previous) for (const auto& frame : *previous)
+    if (frame) frames.emplace(frame->id(), frame);
+  const auto pose_json = [](const Transformation& pose) {
+    std::ostringstream stream;
+    const auto p = pose.getPosition();
+    const auto q = pose.getRotation().toImplementation();
+    if (!p.allFinite() || !q.coeffs().allFinite()) return std::string("null");
+    stream << std::setprecision(12) << "{\"p\":[" << p.x() << ',' << p.y() << ',' << p.z()
+           << "],\"q_xyzw\":[" << q.x() << ',' << q.y() << ',' << q.z() << ',' << q.w() << "]}";
+    return stream.str();
+  };
+  std::ostringstream out;
+  out << std::setprecision(12) << "{\"applied_bundle\":" << last_updated_nframe_
+      << ",\"optimized_bundle\":" << last_optimized_nframe_.load() << ",\"frames\":[";
+  bool first = true;
+  size_t count = 0;
+  std::map<int, PointPtr> points;
+  for (const auto& item : frames) {
+    const auto& frame = item.second;
+    if (count++ >= 32) break;
+    if (!first) { out << ','; } first = false;
+    out << "{\"frame_id\":" << frame->id() << ",\"bundle\":" << frame->bundleId()
+        << ",\"backend_id\":\"" << createNFrameId(frame->bundleId()).asInteger()
+        << "\",\"keyframe\":" << (frame->isKeyframe() ? "true" : "false")
+        << ",\"features\":" << frame->numFeatures() << ",\"landmarks\":" << frame->numLandmarks()
+        << ",\"landmarks_in_ba\":" << frame->numLandmarksInBA()
+        << ",\"frontend_pose\":" << pose_json(frame->T_world_imu());
+    Transformation backend_pose;
+    out << ",\"backend_pose\":";
+    if (backend_.get_T_WS(createNFrameId(frame->bundleId()), backend_pose)) out << pose_json(backend_pose);
+    else out << "null";
+    out << '}';
+    for (const auto& point : frame->landmark_vec_)
+      if (point) points.emplace(point->id(), point);
+  }
+  out << "],\"landmarks\":[";
+  first = true; count = 0;
+  for (const auto& item : points) {
+    if (count++ >= 24) break;
+    if (!first) { out << ','; } first = false;
+    out << "{\"point_id\":" << item.first << ",\"p\":";
+    const auto p = item.second->pos_;
+    if (p.allFinite()) out << '[' << p.x() << ',' << p.y() << ',' << p.z() << ']';
+    else out << "null";
+    out << '}';
+  }
+  out << "]}";
+  return out.str();
+}
+
 // Get a motion prior for new_frames and update the frontend map and last_frames
 // (note that map is not used, but actually all keyframes in map are updated
 //  in call to updateActiveKeyframes() )
@@ -157,6 +236,12 @@ void CeresBackendInterface::loadMapFromBundleAdjustment(
   }
 
   std::lock_guard<std::mutex> lock(mutex_backend_);
+
+  const auto feedback_now = std::chrono::steady_clock::now();
+  const bool feedback_sample = options_.trace_consistency && map && map->size() > 0 &&
+      feedback_now - consistency_last_feedback_ >= std::chrono::seconds(1);
+  const std::string feedback_before = feedback_sample
+      ? frontendConsistencySnapshot(last_frames, map) : std::string();
 
   const bool trace = options_.trace_handoff && map && map->size() > 0 &&
       handoff_trace_frames_ < options_.trace_handoff_frames;
@@ -296,6 +381,15 @@ void CeresBackendInterface::loadMapFromBundleAdjustment(
 
   // shift state
   last_updated_nframe_ = last_optimized_nframe_.load();
+  if (feedback_sample) {
+    std::ostringstream record;
+    record << "{\"schema\":1,\"kind\":\"frontend_feedback\",\"instance\":\""
+           << consistency_instance_ << "\",\"image_stamp_ns\":\""
+           << new_frames->getMinTimestampNanoseconds() << "\",\"before\":"
+           << feedback_before << ",\"after\":" << frontendConsistencySnapshot(last_frames, map) << '}';
+    writeConsistencyRecord(record.str());
+    consistency_last_feedback_ = feedback_now;
+  }
 }
 
 // Add feature correspondences and landmarks to backend
@@ -326,6 +420,22 @@ void CeresBackendInterface::bundleAdjustment(const FrameBundlePtr& frame_bundle)
   timer.start();
   // Checking for zero motion ------------------------------------------------
   bool velocity_prior_added = false;
+  if (stationary_box_test_active_ &&
+      std::chrono::steady_clock::now() >= stationary_box_test_deadline_) {
+    stationary_box_test_active_ = false;
+    LOG(INFO) << "SVO_BOX_TEST phase=expired";
+  }
+  const double image_stamp = frame_bundle->at(0)->getTimestampSec();
+  const bool box_test_prior = stationary_box_test_active_ &&
+      image_stamp >= stationary_box_test_image_start_ &&
+      image_stamp < stationary_box_test_image_start_ + stationary_box_test_duration_;
+  if (box_test_prior) {
+    velocity_prior_added = backend_.addVelocityPrior(
+        createNFrameId(frame_bundle->getBundleId()),
+        Eigen::Matrix<FloatType, 3, 1>::Zero(), 0.01);
+    if (!velocity_prior_added)
+      LOG(ERROR) << "SVO_BOX_TEST phase=prior_failed image=" << image_stamp;
+  }
   if (motion_detector_)
   {
     double sigma = 0;
@@ -333,7 +443,7 @@ void CeresBackendInterface::bundleAdjustment(const FrameBundlePtr& frame_bundle)
     {
       ++no_motion_counter_;
 
-      if (no_motion_counter_ > options_.backend_zero_motion_check_n_frames)
+      if (no_motion_counter_ > options_.backend_zero_motion_check_n_frames && !box_test_prior)
       {
         image_motion_detector_stationary_ = true;
         VLOG(5) << "Image is not moving: adding zero velocity prior.";
@@ -358,7 +468,7 @@ void CeresBackendInterface::bundleAdjustment(const FrameBundlePtr& frame_bundle)
   }
 
   // only use imu-based motion detection when the images are not good
-  if (!image_motion_detector_stationary_ && imu_motion_detector_stationary_)
+  if (!box_test_prior && !image_motion_detector_stationary_ && imu_motion_detector_stationary_)
   {
     VLOG(5) << "IMU determined stationary, adding prior at time "
             << frame_bundle->at(0)->getTimestampSec() << std::endl;
@@ -373,6 +483,19 @@ void CeresBackendInterface::bundleAdjustment(const FrameBundlePtr& frame_bundle)
     {
       velocity_prior_added = true;
     }
+  }
+
+  if (options_.trace_motion_detector) {
+    const MotionDetector::Diagnostics d = motion_detector_
+        ? motion_detector_->diagnostics() : MotionDetector::Diagnostics();
+    LOG(INFO) << "SVO_ZERO_MOTION image=" << std::setprecision(17) << image_stamp
+              << " reason=" << (motion_detector_ ? d.reason : "disabled")
+              << " correspondences=" << d.correspondences
+              << " moving=" << d.moving << " allowed_moving=" << d.allowed_moving
+              << " max_displacement_px=" << d.max_displacement_px
+              << " stationary_count=" << no_motion_counter_
+              << " imu_stationary=" << imu_motion_detector_stationary_
+              << " box_test=" << box_test_prior << " prior_added=" << velocity_prior_added;
   }
 
   // Adding new landmarks to backend -----------------------------------------
@@ -583,13 +706,57 @@ void CeresBackendInterface::addLandmarksAndObservationsToBackend(
 }
 
 // Introduce a state for the frame_bundle in backend. Add IMU terms.
+void CeresBackendInterface::setInitialBiases(
+    const Eigen::Vector3d& gyro, const Eigen::Vector3d& accel)
+{
+  std::lock_guard<std::mutex> lock(mutex_backend_);
+  CHECK_EQ(backend_.numFrames(), 0u);
+  backend_.setInitialGyroscopeBias(gyro);
+  backend_.setInitialAccelerometerBias(accel);
+  imu_handler_->setGyroscopeBias(gyro);
+  imu_handler_->setAccelerometerBias(accel);
+  LOG(INFO) << "SVO_INIT_BIAS source=frozen_stationary_calibration gyro=["
+            << gyro.transpose() << "] accel=[" << accel.transpose() << "]";
+}
+
 void CeresBackendInterface::setInitialGravityMeasurements(
-    const ImuMeasurements& measurements)
+    const ImuMeasurements& measurements, bool initialize_gyro_bias,
+    bool initialize_radial_accel_bias)
 {
   std::lock_guard<std::mutex> lock(mutex_backend_);
   CHECK_EQ(backend_.numFrames(), 0u);
   CHECK_GE(measurements.size(), 2u);
   initial_gravity_measurements_ = measurements;
+  if (initialize_radial_accel_bias)
+  {
+    Eigen::Vector3d mean = Eigen::Vector3d::Zero();
+    for (const auto& m : measurements) mean += m.linear_acceleration_;
+    mean /= measurements.size();
+    CHECK(mean.allFinite());
+    CHECK_GT(mean.norm(), 1.0);
+    // A single static orientation identifies only this assumed radial residual.
+    // This is not a full three-axis accelerometer calibration.
+    const Eigen::Vector3d bias = mean -
+        imu_handler_->imu_calib_.gravity_magnitude * mean.normalized();
+    backend_.setInitialAccelerometerBias(bias);
+    imu_handler_->setAccelerometerBias(bias);
+    LOG(INFO) << std::setprecision(17)
+              << "SVO_INIT_ACCEL_BIAS source=stationary_radial_residual bias_m_s2=["
+              << bias.transpose() << "] mean_norm=" << mean.norm()
+              << " gravity=" << imu_handler_->imu_calib_.gravity_magnitude;
+  }
+  if (initialize_gyro_bias)
+  {
+    Eigen::Vector3d mean = Eigen::Vector3d::Zero();
+    for (const auto& m : measurements) mean += m.angular_velocity_;
+    mean /= measurements.size();
+    CHECK(mean.allFinite());
+    backend_.setInitialGyroscopeBias(mean);
+    imu_handler_->setGyroscopeBias(mean);
+    LOG(INFO) << std::setprecision(17)
+              << "SVO_INIT_GYRO_BIAS source=stationary_gravity_window mean_rad_s=["
+              << mean.transpose() << "] count=" << measurements.size();
+  }
 }
 
 bool CeresBackendInterface::addStatesAndInertialMeasurementsToBackend(
@@ -774,13 +941,74 @@ void CeresBackendInterface::optimizationLoop()
   VLOG(1) << "Optimization thread ended.";
 }
 
+void CeresBackendInterface::writeConsistencyRecord(const std::string& record)
+{
+  // Bound extra eMMC use across backend resets in this launch, not per reset.
+  const size_t max_bytes = 16u * 1024u * 1024u;
+  if (!consistency_trace_open_attempted_) {
+    consistency_trace_open_attempted_ = true;
+    const std::string path = options_.consistency_trace_dir + "/backend_consistency.jsonl";
+    std::ifstream existing(path, std::ios::binary | std::ios::ate);
+    if (existing.good()) consistency_trace_bytes_ = static_cast<size_t>(existing.tellg());
+    consistency_trace_.open(path, std::ios::out | std::ios::app);
+  }
+  struct statvfs space;
+  const bool disk_ok = statvfs(options_.consistency_trace_dir.c_str(), &space) == 0 &&
+      static_cast<uint64_t>(space.f_bavail) * space.f_frsize >= 512ull * 1024ull * 1024ull;
+  if (consistency_trace_ && disk_ok &&
+      consistency_trace_bytes_ + record.size() + 1 <= max_bytes) {
+    consistency_trace_ << record << '\n';
+    consistency_trace_.flush();
+    consistency_trace_bytes_ += record.size() + 1;
+  }
+  // The workstation bag is authoritative even after the local file hits its cap.
+  if (publisher_) publisher_->publishConsistency(record);
+}
+
 void CeresBackendInterface::optimizationStep()
 {
   vk::Timer timer;
+  const auto diagnostic_start = std::chrono::steady_clock::now();
+  bool consistency_sample = options_.trace_consistency &&
+      (diagnostic_start - consistency_last_sample_ >= std::chrono::seconds(1));
+  std::ostringstream consistency;
+  bool first_snapshot = true;
+  bool consistency_started = false;
+  double diagnostic_ms = 0;
+  const auto snapshot = [&](const char* phase, bool residuals) {
+    if (!consistency_sample) return;
+    const auto snapshot_start = std::chrono::steady_clock::now();
+    if (!consistency_started) {
+      consistency_started = true;
+      consistency << "{\"schema\":1,\"kind\":\"optimization\",\"instance\":\""
+                  << consistency_instance_ << "\",\"cycle\":"
+                  << ++consistency_sequence_ << ",\"bundle\":" << last_added_nframe_images_
+                  << ",\"image_stamp_ns\":\"" << last_added_frame_stamp_ns_
+                  << "\",\"snapshots\":[";
+    }
+    if (!first_snapshot) consistency << ',';
+    first_snapshot = false;
+    consistency << "{\"phase\":\"" << phase << "\",\"backend\":"
+                << backend_.diagnosticSnapshot(24, residuals) << '}';
+    diagnostic_ms += std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now()-snapshot_start).count();
+  };
+  std::string world_correction = "null";
   {
     std::lock_guard<std::mutex> lock(w_T_correction_mut_);
     if (is_w_T_valid_)
     {
+      // Explicit world transformations are never missed by the 1 Hz sampling.
+      if (options_.trace_consistency) consistency_sample = true;
+      snapshot("before_world_transform", false);
+      if (consistency_sample) {
+        std::ostringstream transform;
+        const auto q = w_T_correction_to_apply_.getRotation().toImplementation();
+        const auto p = w_T_correction_to_apply_.getPosition();
+        transform << std::setprecision(12) << "{\"p\":[" << p.x() << ',' << p.y() << ',' << p.z()
+                  << "],\"q_xyzw\":[" << q.x() << ',' << q.y() << ',' << q.z() << ',' << q.w() << "]}";
+        world_correction = transform.str();
+      }
       backend_.removeAllPoseFixation();
       backend_.transformMap(
           w_T_correction_to_apply_,
@@ -793,9 +1021,11 @@ void CeresBackendInterface::optimizationStep()
       }
       backend_.setOldestFrameFixed();
       is_w_T_valid_ = false;
+      snapshot("after_world_transform", false);
     }
   }
 
+  snapshot("before_marginalization", false);
   timer.start();
   MarginalizationTiming mag_timing;
   if (optimizer_options_.marginalize)
@@ -808,6 +1038,7 @@ void CeresBackendInterface::optimizationStep()
     }
     updateActiveKeyframes();
   }
+  snapshot("after_marginalization", false);
   if (g_permon_backend_)
   {
     g_permon_backend_->log("marginalization", timer.stop());
@@ -834,6 +1065,8 @@ void CeresBackendInterface::optimizationStep()
 
   if (g_permon_backend_)
     g_permon_backend_->log("n_fixed_lm", backend_.numFixedLandmarks());
+  snapshot("before_optimization", true);
+  const bool optimization_skipped = skip_optimization_once_;
   timer.start();
   if (skip_optimization_once_)
   {
@@ -847,6 +1080,7 @@ void CeresBackendInterface::optimizationStep()
   }
   if (g_permon_backend_)
     g_permon_backend_->log("ceres_time", timer.stop());
+  snapshot("after_optimization", true);
 
   last_optimized_nframe_.store(last_added_nframe_images_);
   if (g_permon_backend_)
@@ -874,6 +1108,23 @@ void CeresBackendInterface::optimizationStep()
   {
     publisher_->publish(last_state_, last_added_frame_stamp_ns_,
                         last_optimized_nframe_.load());
+  }
+  if (consistency_sample) {
+    const auto q = T_WS.getRotation().toImplementation();
+    const auto p = T_WS.getPosition();
+    consistency << std::setprecision(12) << "],\"world_correction\":" << world_correction
+                << ",\"optimization_skipped\":" << (optimization_skipped ? "true" : "false")
+                << ",\"published\":{\"bundle\":" << last_optimized_nframe_.load()
+                << ",\"image_stamp_ns\":\"" << last_added_frame_stamp_ns_
+                << "\",\"p\":[" << p.x() << ',' << p.y() << ',' << p.z()
+                << "],\"q_xyzw\":[" << q.x() << ',' << q.y() << ',' << q.z() << ',' << q.w()
+                << "],\"velocity_gyro_bias_acc_bias\":[";
+    for (int k = 0; k < 9; ++k) { if (k) { consistency << ','; } consistency << speed_and_bias[k]; }
+    consistency << "]},\"diagnostic_ms\":" << diagnostic_ms << ",\"cycle_wall_ms\":"
+                << std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now()-diagnostic_start).count()
+                << '}';
+    writeConsistencyRecord(consistency.str());
+    consistency_last_sample_ = diagnostic_start;
   }
 }
 
