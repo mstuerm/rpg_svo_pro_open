@@ -96,9 +96,19 @@ bool AbstractInitialization::trackFeaturesAndCheckDisparity(const FrameBundlePtr
 
   const size_t num_tracked_tot =
       std::accumulate(num_tracked.begin(), num_tracked.end(), 0u);
-  const double avg_disparity =
+  const double avg_disparity = disparity.empty() ? 0.0 :
       std::accumulate(disparity.begin(), disparity.end(), 0.0) / disparity.size();
   VLOG(3) << "Init: Tracked " << num_tracked_tot << " features with disparity = " << avg_disparity;
+  const char* gate_result = num_tracked_tot < options_.init_min_features
+      ? "reset_reference_insufficient_tracks"
+      : (avg_disparity < options_.init_min_disparity ? "wait_disparity" : "candidate");
+  SVO_INFO_STREAM("SVO_INIT_DIAG phase=track frame_ns="
+      << frames->getMinTimestampNanoseconds() << " result=" << gate_result
+      << " tracked=" << num_tracked_tot
+      << " required_tracks=" << options_.init_min_features
+      << " disparity_px=" << avg_disparity
+      << " required_disparity_px=" << options_.init_min_disparity
+      << " disparity_samples=" << disparity.size());
   if(num_tracked_tot < options_.init_min_features)
   {
     tracker_->resetActiveTracks();
@@ -336,6 +346,13 @@ InitResult FivePointInit::addFrameBundle(
   ransac.computeModel();
 
   // enough inliers?
+  SVO_INFO_STREAM("SVO_INIT_DIAG phase=fivepoint frame_ns="
+      << frames_cur->getMinTimestampNanoseconds()
+      << " reference_ns=" << frames_ref->getMinTimestampNanoseconds()
+      << " matches=" << matches_cur_ref.size()
+      << " ransac_inliers=" << ransac.inliers_.size()
+      << " required_inliers=" << options_.init_min_inliers
+      << " iterations=" << ransac.iterations_);
   if(ransac.inliers_.size() < options_.init_min_inliers)
   {
     VLOG(3) << "5Pt RANSAC has only " << ransac.inliers_.size() << " inliers. "
@@ -357,12 +374,27 @@ InitResult FivePointInit::addFrameBundle(
           << "T.translation() = " << T_cur_from_ref_.getPosition();
 
   // Triangulate
+  const size_t ransac_inlier_count = ransac.inliers_.size();
+  const size_t triangulation_input_count = matches_cur_ref.size();
   if(initialization_utils::triangulateAndInitializePoints(
         frames_cur->at(0), frames_ref->at(0), T_cur_from_ref_, options_.reproj_error_thresh,
         depth_at_current_frame_, options_.init_min_inliers, matches_cur_ref))
   {
+    SVO_INFO_STREAM("SVO_INIT_DIAG phase=triangulation result=accepted frame_ns="
+        << frames_cur->getMinTimestampNanoseconds()
+        << " ransac_inliers=" << ransac_inlier_count
+        << " input_matches=" << triangulation_input_count
+        << " surviving_inliers=" << matches_cur_ref.size()
+        << " required_inliers=" << options_.init_min_inliers);
     return InitResult::kSuccess;
   }
+  SVO_WARN_STREAM("SVO_INIT_DIAG phase=triangulation result=rejected frame_ns="
+      << frames_cur->getMinTimestampNanoseconds()
+      << " ransac_inliers=" << ransac_inlier_count
+      << " input_matches=" << triangulation_input_count
+      << " surviving_inliers=" << matches_cur_ref.size()
+      << " required_inliers=" << options_.init_min_inliers
+      << " reprojection_threshold_px=" << options_.reproj_error_thresh);
   return InitResult::kFailure;
 
 #else

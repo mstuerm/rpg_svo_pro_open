@@ -988,6 +988,12 @@ void SvoInterface::monoLoop()
   const std::string depth_topic =
       vk::param<std::string>(pnh_, "depth_topic", "");
   image_transport::Subscriber it_sub;
+  const int initialization_queue_size = vk::param<int>(pnh_, "image_queue_size", 5);
+  const int tracking_queue_size = vk::param<int>(
+      pnh_, "image_tracking_queue_size", initialization_queue_size);
+  int active_queue_size = initialization_queue_size;
+  ros::Publisher queue_size_pub = pnh_.advertise<std_msgs::UInt32>(
+      "image_queue_size_active", 1, true);
   std::unique_ptr<image_transport::SubscriberFilter> image_filter;
   std::unique_ptr<image_transport::SubscriberFilter> depth_filter;
   typedef message_filters::sync_policies::ExactTime<
@@ -996,13 +1002,16 @@ void SvoInterface::monoLoop()
   if(depth_topic.empty())
   {
     // Retain a small burst while initialization blocks the image callback.
-    const int image_queue_size = vk::param<int>(pnh_, "image_queue_size", 5);
-    if (image_queue_size < 1) {
-      ROS_FATAL("image_queue_size must be positive");
+    if (initialization_queue_size < 1 || tracking_queue_size < 1) {
+      ROS_FATAL("Image queue sizes must be positive");
       return;
     }
-    ROS_INFO("Mono image subscriber queue: %d", image_queue_size);
-    it_sub = it.subscribe(image_topic, image_queue_size, &svo::SvoInterface::monoCallback, this);
+    ROS_INFO("Mono image subscriber queue: initialization=%d tracking=%d",
+             initialization_queue_size, tracking_queue_size);
+    it_sub = it.subscribe(image_topic, active_queue_size, &svo::SvoInterface::monoCallback, this);
+    std_msgs::UInt32 message;
+    message.data = active_queue_size;
+    queue_size_pub.publish(message);
   }
   else
   {
@@ -1017,7 +1026,33 @@ void SvoInterface::monoLoop()
 
   while(ros::ok() && !quit_)
   {
-    queue.callAvailable(ros::WallDuration(0.1));
+    // Check the stage after each image, rather than draining a captured batch
+    // of initialization callbacks before switching to the tracking queue.
+    if (depth_topic.empty())
+      queue.callOne(ros::WallDuration(0.1));
+    else
+      queue.callAvailable(ros::WallDuration(0.1));
+    if (depth_topic.empty()) {
+      int desired_queue_size;
+      {
+        std::lock_guard<std::mutex> lock(pipeline_mutex_);
+        desired_queue_size = (!idle_ && svo_->stage() == Stage::kTracking)
+            ? tracking_queue_size : initialization_queue_size;
+      }
+      if (desired_queue_size != active_queue_size) {
+        it_sub.shutdown();
+        // This callback queue belongs only to the image loop. IMU callbacks
+        // and the IMU history remain untouched, as do map/backend state.
+        queue.clear();
+        active_queue_size = desired_queue_size;
+        it_sub = it.subscribe(image_topic, active_queue_size,
+                              &svo::SvoInterface::monoCallback, this);
+        std_msgs::UInt32 message;
+        message.data = active_queue_size;
+        queue_size_pub.publish(message);
+        ROS_INFO("Mono image subscriber queue switched to %d", active_queue_size);
+      }
+    }
   }
 }
 
