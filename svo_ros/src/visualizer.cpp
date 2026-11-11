@@ -27,6 +27,7 @@
 #include <svo_msgs/DenseInput.h>
 #include <svo_msgs/DenseInputWithFeatures.h>
 #include <svo_msgs/Info.h>
+#include <svo_msgs/PolicyHealth.h>
 
 #include <svo/frame_handler_base.h>
 #include <svo/common/frame.h>
@@ -173,6 +174,7 @@ Visualizer::Visualizer(const std::string& trace_dir,
   pub_points_ = pnh_.advertise<visualization_msgs::Marker>("points", 10000);
   pub_imu_pose_ =
       pnh_.advertise<geometry_msgs::PoseWithCovarianceStamped>("pose_imu", 10);
+  pub_policy_health_ = pnh_.advertise<svo_msgs::PolicyHealth>("policy_health", 10);
   pub_info_ = pnh_.advertise<svo_msgs::Info>("info", 10);
   pub_markers_ = pnh_.advertise<visualization_msgs::Marker>("markers", 100);
   pub_pc_ = pnh_.advertise<PointCloud>("pointcloud", 1);
@@ -223,10 +225,56 @@ Visualizer::Visualizer(const std::string& trace_dir,
 #endif
 }
 
+void Visualizer::publishPolicyHealth(const FrameHandlerBase* frontend, int64_t timestamp)
+{
+  svo_msgs::PolicyHealth msg;
+  msg.header.stamp = ros::Time().fromNSec(timestamp);
+  msg.header.frame_id = "cam0";
+  const auto frames = frontend->getLastFrames();
+  const bool fresh = frames && frames->size() > 0 &&
+      frames->at(0)->getTimestampNSec() == timestamp;
+  if (timestamp < policy_health_stamp_ || !fresh || frontend->stage() == Stage::kPaused)
+    resetPolicyHealth();
+  PolicyHealthValues values;
+  if (fresh && frontend->stage() != Stage::kPaused) {
+    // Never count repeated publication of an image as a new track observation.
+    if (timestamp == policy_health_stamp_) return;
+    const auto& frame = frames->at(0);
+    std::unordered_set<int64_t> ids;
+    std::vector<double> errors;
+    std::size_t count = 0;
+    for (std::size_t i = 0; i < frame->num_features_; ++i) {
+      const auto& landmark = frame->landmark_vec_.at(i);
+      const bool tracked =
+          (landmark && !isFixedLandmark(frame->type_vec_[i]) &&
+           !isMapPoint(frame->type_vec_[i])) || isCornerEdgeletSeed(frame->type_vec_[i]);
+      if (!tracked) continue;
+      ++count;
+      const int64_t id = frame->track_id_vec_(i);
+      if (id >= 0) ids.insert(id);
+      if (landmark) {
+        Eigen::Vector2d pixel;
+        if (frame->cam()->project3(frame->T_cam_world() * landmark->pos(), &pixel))
+          errors.push_back((pixel - frame->px_vec_.col(i)).norm());
+      }
+    }
+    values = policy_health_.update(count, ids, errors);
+    policy_health_stamp_ = timestamp;
+    msg.telemetry_available = true;
+  }
+  msg.tracked_feature_count = values.count;
+  msg.tracked_landmark_survival_ratio = values.survival;
+  msg.median_reprojection_error_px = values.reprojection;
+  msg.median_track_age_frames = values.age;
+  std::copy(values.normalized.begin(), values.normalized.end(), msg.normalized.begin());
+  pub_policy_health_.publish(msg);
+}
+
 void Visualizer::publishSvoInfo(const svo::FrameHandlerBase* const svo,
                                 const int64_t timestamp_nanoseconds)
 {
   CHECK_NOTNULL(svo);
+  publishPolicyHealth(svo, timestamp_nanoseconds);
   ++trace_id_;
 
   if (pub_info_.getNumSubscribers() == 0)

@@ -824,6 +824,7 @@ void SvoInterface::inputKeyCallback(const std_msgs::StringConstPtr& key_input)
         publishStationaryCalibration("failed", "reason=requires_imu_and_ceres");
         return;
       }
+      visualizer_->resetPolicyHealth();
       svo_->resetForInitialization();
       ceres_backend_interface_.reset();
       ensureBackend();
@@ -861,6 +862,7 @@ void SvoInterface::inputKeyCallback(const std_msgs::StringConstPtr& key_input)
       }
       gravity_initialization_pending_ = false;
       gravity_initialization_measurements_.clear();
+      visualizer_->resetPolicyHealth();
       svo_->reset();
       pampc_landmark_persistence_.clear();
       // FrameHandlerBase::reset() is deferred until the end of the next
@@ -878,6 +880,7 @@ void SvoInterface::inputKeyCallback(const std_msgs::StringConstPtr& key_input)
       // Retire the old map/backend before the next image selects its reference.
       // processImageBundle will create the fresh backend BEFORE addFrameBundle,
       // allowing its gravity prior to set the very first reference pose.
+      visualizer_->resetPolicyHealth();
       svo_->resetForInitialization();
       ceres_backend_interface_.reset();
       // Construct the backend before beginning the timed hover window. Its

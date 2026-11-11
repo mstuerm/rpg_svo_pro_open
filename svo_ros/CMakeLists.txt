@@ -21,6 +21,7 @@ include_directories(${GTSAM_INCLUDE_DIR})
 set(HEADERS
   include/svo_ros/svo_interface.h
   include/svo_ros/svo_factory.h
+  include/svo_ros/policy_health.h
   include/svo_ros/visualizer.h
   include/svo_ros/svo_nodelet.h
   include/svo_ros/csv_dataset_reader.h
@@ -58,6 +59,11 @@ target_link_libraries(svo_node ${PROJECT_NAME})
 
 cs_add_library(svo_nodelet src/svo_nodelet.cpp)
 target_link_libraries(svo_nodelet ${PROJECT_NAME})
+
+if(CATKIN_ENABLE_TESTING)
+  add_executable(test_policy_health test/test_policy_health.cpp)
+  add_test(NAME svo_policy_health COMMAND test_policy_health)
+endif()
 
 cs_install()
 install(FILES svo_nodelet.xml

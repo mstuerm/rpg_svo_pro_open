@@ -5,6 +5,7 @@
 
 #pragma once
 
+#include <svo_ros/policy_health.h>
 #include <utility>  // std::pair
 #include <iostream>
 
@@ -66,6 +67,11 @@ public:
   ros::Publisher pub_points_;
   ros::Publisher pub_imu_pose_;
   ros::Publisher pub_info_;
+  ros::Publisher pub_policy_health_;
+  PolicyHealthAccumulator policy_health_;
+  int64_t policy_health_stamp_ = -1;
+  void resetPolicyHealth() { policy_health_.reset(); policy_health_stamp_ = -1; }
+  void publishPolicyHealth(const FrameHandlerBase* frontend, int64_t timestamp);
   ros::Publisher pub_markers_;
   ros::Publisher pub_pc_;
   PointCloud::Ptr pc_;
