@@ -6,6 +6,7 @@ find_package(catkin REQUIRED COMPONENTS
   message_generation
   geometry_msgs
   sensor_msgs
+  std_msgs
 )
 
 # search for all msg files
@@ -23,6 +24,7 @@ generate_messages(
   DEPENDENCIES
   geometry_msgs
   sensor_msgs
+  std_msgs
 )
 
 # export the dependencis of this package for who ever depends on us

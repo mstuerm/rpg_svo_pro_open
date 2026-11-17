@@ -1,3 +1,5 @@
+#include <limits>
+#include <svo_msgs/PampcFeatures.h>
 #include <svo_ros/svo_interface.h>
 
 #include <ros/callback_queue.h>
@@ -114,6 +116,7 @@ SvoInterface::SvoInterface(
         new Visualizer(svo_->options_.trace_dir, pnh_, ncam_->getNumCameras()));
   pub_pampc_landmarks_ =
       pnh_.advertise<pcl::PointCloud<pcl::PointXYZ>>("pampc_landmarks", 2);
+  pub_pampc_features_ = pnh_.advertise<svo_msgs::PampcFeatures>("pampc_features", 5);
 
   if(vk::param<bool>(pnh_, "use_imu", false))
   {
@@ -355,10 +358,17 @@ void SvoInterface::publishPampcLandmarks(
   pcl_conversions::toPCL(
       ros::Time().fromNSec(timestamp_nanoseconds), cloud.header.stamp);
 
+  svo_msgs::PampcFeatures telemetry;
+  telemetry.header.frame_id = Visualizer::kWorldFrame;
+  telemetry.header.stamp.fromNSec(timestamp_nanoseconds);
+  telemetry.map_epoch = pampc_map_epoch_;
   const FrameBundlePtr frames = svo_->getLastFrames();
   if(!frames || frames->size() == 0u)
   {
     pampc_landmark_persistence_.clear();
+      ++pampc_map_epoch_;
+    telemetry.map_epoch = pampc_map_epoch_;
+    pub_pampc_features_.publish(telemetry);
     pub_pampc_landmarks_.publish(cloud);
     return;
   }
@@ -393,13 +403,23 @@ void SvoInterface::publishPampcLandmarks(
     const bool tracked =
         (!isFixedLandmark(type) && !isMapPoint(type)) ||
         isCornerEdgeletSeed(type);
-    if(!tracked || pampc_landmark_persistence_[landmark->id()] < 3)
-      continue;
-
     Eigen::Vector2d reprojected_pixel;
     const auto projection = frame->cam()->project3(
         frame->T_cam_world() * landmark->pos(), &reprojected_pixel);
-    if(!projection ||
+    svo_msgs::PampcFeature feature;
+    feature.landmark_id = landmark->id();
+    feature.mapped = true;
+    feature.tracked = tracked;
+    feature.position.x = landmark->pos().x();
+    feature.position.y = landmark->pos().y();
+    feature.position.z = landmark->pos().z();
+    feature.u = frame->px_vec_(0,index);
+    feature.v = frame->px_vec_(1,index);
+    feature.reprojection_error_px = projection
+        ? (reprojected_pixel - frame->px_vec_.col(index)).norm()
+        : std::numeric_limits<double>::infinity();
+    telemetry.features.push_back(feature);
+    if(!tracked || pampc_landmark_persistence_[landmark->id()] < 3 || !projection ||
        !std::isfinite(reprojected_pixel.x()) ||
        !std::isfinite(reprojected_pixel.y()) ||
        (reprojected_pixel - frame->px_vec_.col(index)).norm() > 2.0)
@@ -412,6 +432,7 @@ void SvoInterface::publishPampcLandmarks(
         static_cast<float>(position.x()), static_cast<float>(position.y()),
         static_cast<float>(position.z())));
   }
+  pub_pampc_features_.publish(telemetry);
   pub_pampc_landmarks_.publish(cloud);
 }
 
@@ -835,6 +856,7 @@ void SvoInterface::inputKeyCallback(const std_msgs::StringConstPtr& key_input)
       stationary_calibration_start_ = ros::Time::now().toSec();
       idle_ = true;  // IMU collection only: do not create a visual map or states.
       pampc_landmark_persistence_.clear();
+      ++pampc_map_epoch_;
       publishStationaryCalibration("collecting", "elapsed_s=0");
       break;
     case 'v':
@@ -865,6 +887,7 @@ void SvoInterface::inputKeyCallback(const std_msgs::StringConstPtr& key_input)
       visualizer_->resetPolicyHealth();
       svo_->reset();
       pampc_landmark_persistence_.clear();
+      ++pampc_map_epoch_;
       // FrameHandlerBase::reset() is deferred until the end of the next
       // frame. Keep callbacks enabled so that frame can retire the frontend
       // map and Ceres backend before a subsequent START command.
@@ -908,6 +931,7 @@ void SvoInterface::inputKeyCallback(const std_msgs::StringConstPtr& key_input)
       }
       svo_->start();
       pampc_landmark_persistence_.clear();
+      ++pampc_map_epoch_;
       idle_ = false;
       SVO_INFO_STREAM("SVO user input: START (old frontend/backend cleared before first reference)");
       break;

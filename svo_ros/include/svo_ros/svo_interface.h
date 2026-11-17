@@ -49,6 +49,8 @@ public:
   bool trace_processing_stages_ = false;
   std::uint32_t remote_key_ack_count_ = 0;
   ros::Publisher pub_pampc_landmarks_;
+  ros::Publisher pub_pampc_features_;
+  std::uint32_t pampc_map_epoch_ = 0;
   std::string remote_input_;
   std::unique_ptr<std::thread> imu_thread_;
   std::unique_ptr<std::thread> image_thread_;
