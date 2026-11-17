@@ -235,7 +235,15 @@ void CeresBackendInterface::loadMapFromBundleAdjustment(
     return;
   }
 
+  // Called by the frontend thread; these timers share its per-frame CSV.
+  if (g_permon) SVO_START_TIMER("handoff_lock_wait");
   std::lock_guard<std::mutex> lock(mutex_backend_);
+  if (g_permon) {
+    SVO_STOP_TIMER("handoff_lock_wait");
+    SVO_START_TIMER("handoff_locked_work");
+    SVO_LOG("handoff_active_keyframes", active_keyframes_.size());
+    SVO_LOG("handoff_map_updated", 0);
+  }
 
   const auto feedback_now = std::chrono::steady_clock::now();
   const bool feedback_sample = options_.trace_consistency && map && map->size() > 0 &&
@@ -251,28 +259,36 @@ void CeresBackendInterface::loadMapFromBundleAdjustment(
     traceHandoff("before_imu_prior", new_frames, last_frames, map);
   }
 
+  if (g_permon) SVO_START_TIMER("handoff_motion_detector");
   // Setup motion detector ----------------------------------------------------
   if (motion_detector_)
   {
     motion_detector_->setFrames(last_frames, new_frames);
   }
+  if (g_permon) SVO_STOP_TIMER("handoff_motion_detector");
 
+  if (g_permon) SVO_START_TIMER("handoff_add_state_imu");
   // Adding new state to backend ---------------------------------------------
   if (addStatesAndInertialMeasurementsToBackend(new_frames))
   {
     last_added_nframe_imu_ = new_frames->getBundleId();
 
+    if (g_permon) SVO_STOP_TIMER("handoff_add_state_imu");
+    if (g_permon) SVO_START_TIMER("handoff_motion_prior");
     // Obtain motion prior ---------------------------------------------------
     updateBundleStateWithBackend(new_frames, true);
     have_motion_prior = true;
+    if (g_permon) SVO_STOP_TIMER("handoff_motion_prior");
   }
   else
   {
+    if (g_permon) SVO_STOP_TIMER("handoff_add_state_imu");
     LOG(ERROR) << "Could not add frame bundle " << new_frames->getBundleId()
                << " to backend";
     have_motion_prior = false;
   }
 
+  if (g_permon) SVO_START_TIMER("handoff_stationary_check");
   if (imu_handler_ && imu_handler_->options_.temporal_stationary_check)
   {
     IMUTemporalStatus imu_status =
@@ -280,6 +296,7 @@ void CeresBackendInterface::loadMapFromBundleAdjustment(
     imu_motion_detector_stationary_ =
         (imu_status == IMUTemporalStatus::kStationary);
   }
+  if (g_permon) SVO_STOP_TIMER("handoff_stationary_check");
 
   if (trace) traceHandoff("after_imu_prior", new_frames, last_frames, map);
 
@@ -288,9 +305,12 @@ void CeresBackendInterface::loadMapFromBundleAdjustment(
   {
     if (trace) traceHandoff("no_optimized_update", new_frames, last_frames, map);
     VLOG(3) << "VIN: No map update available.";
+    if (g_permon) SVO_STOP_TIMER("handoff_locked_work");
     return;
   }
 
+  if (g_permon) SVO_START_TIMER("handoff_keyframe_poses");
+  if (g_permon) SVO_LOG("handoff_map_updated", 1);
   // Update SVO Map ----------------------------------------------------------
   {
     Transformation T_WS;
@@ -308,15 +328,19 @@ void CeresBackendInterface::loadMapFromBundleAdjustment(
       updateFrameStateWithBackend(keyframe, false);
       n_frames_updated++;
     }
+    if (g_permon) SVO_STOP_TIMER("handoff_keyframe_poses");
+    if (g_permon) SVO_START_TIMER("handoff_landmark_positions");
     if (trace) traceHandoff("after_keyframe_poses", new_frames, last_frames, map);
     VLOG(3) << "Updated " << n_frames_updated << " frames in map.";
 
     // Update the 3d points in map of the updated keyframes ----------------
     // Statistics
     backend_.updateAllActivePoints();
+    if (g_permon) SVO_STOP_TIMER("handoff_landmark_positions");
     if (trace) traceHandoff("after_landmark_positions", new_frames, last_frames, map);
   }
 
+  if (g_permon) SVO_START_TIMER("handoff_last_frame_poses");
   // Update last frame bundle ------------------------------------------------
   {
     // Last frames might not be keyframes (are not yet updated => update pose)
@@ -327,9 +351,11 @@ void CeresBackendInterface::loadMapFromBundleAdjustment(
         updateFrameStateWithBackend(last_frame, true);
       }
     }
+    if (g_permon) SVO_STOP_TIMER("handoff_last_frame_poses");
 
     if (trace) traceHandoff("before_outlier_rejection", new_frames, last_frames, map);
 
+    if (g_permon) SVO_START_TIMER("handoff_outlier_rejection");
     // Remove outliers of last_frames ----------------------------------------
     if (outlier_rejection_)
     {
@@ -358,6 +384,8 @@ void CeresBackendInterface::loadMapFromBundleAdjustment(
       }
     }
 
+    if (g_permon) SVO_STOP_TIMER("handoff_outlier_rejection");
+    if (g_permon) SVO_START_TIMER("handoff_bias_update");
     if (trace) traceHandoff("after_outlier_rejection", new_frames, last_frames, map);
 
     // The following is not used for the algorithm to work, but updated for
@@ -369,14 +397,17 @@ void CeresBackendInterface::loadMapFromBundleAdjustment(
                             "optimizer";
     imu_handler_->setAccelerometerBias(speed_and_bias.tail<3>());
     imu_handler_->setGyroscopeBias(speed_and_bias.segment<3>(3));
+    if (g_permon) SVO_STOP_TIMER("handoff_bias_update");
 
     // A publisher is optional. In the direct pybind11 path no ROS publisher
     // is constructed, while the optimizer and frontend map handoff are still
     // fully functional.
+    if (g_permon) SVO_START_TIMER("handoff_publisher_enqueue");
     if (publisher_)
     {
       publisher_->addFrame(last_added_nframe_imu_);
     }
+    if (g_permon) SVO_STOP_TIMER("handoff_publisher_enqueue");
   }
 
   // shift state
@@ -390,6 +421,7 @@ void CeresBackendInterface::loadMapFromBundleAdjustment(
     writeConsistencyRecord(record.str());
     consistency_last_feedback_ = feedback_now;
   }
+  if (g_permon) SVO_STOP_TIMER("handoff_locked_work");
 }
 
 // Add feature correspondences and landmarks to backend
